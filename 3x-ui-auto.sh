@@ -13,12 +13,6 @@ msg_err() { echo -e "\e[1;41m $1 \e[0m"; }
 msg_inf() { echo -e "\e[1;34m$1\e[0m"; }
 
 echo
-msg_inf '  ____        _   _ ___       _         _        '
-msg_inf ' |___ /_  __ | | | |_ _|     / \  _   _| |_ ___  '
-msg_inf '   |_ \ \/ / | | | || |_____/ _ \| | | | __/ _ \ '
-msg_inf '  ___) >  <  | |_| || |_____/ ___ \ |_| | || (_) |'
-msg_inf ' |____/_/\_\  \___/|___|   /_/   \_\__,_|\__\___/ '
-echo
 _os_id=$(grep -oP '(?<=^ID=).+' /etc/os-release 2>/dev/null | tr -d '"')
 _os_ver=$(grep -oP '(?<=^VERSION_ID=).+' /etc/os-release 2>/dev/null | tr -d '"')
 echo "The OS release is: ${_os_id^} ${_os_ver}"
@@ -368,9 +362,8 @@ choose_hy2() {
         echo
         msg_inf '────────────────────────────────────────────────────────────────────────────────'
         msg_inf 'UDP-порт для Hysteria 2:'
-        echo '  Enter без ввода выберет случайный свободный порт'
         msg_inf '────────────────────────────────────────────────────────────────────────────────'
-        echo -en 'Порт: '
+        echo -en 'Порт (Enter - случайный доступный порт): '
         tty_read || return 1
         p=${REPLY//[[:space:]]/}
         if [[ -z "$p" ]]; then
@@ -853,11 +846,11 @@ install_panel() {
         return 1
     fi
     msg_inf "Устанавливаю 3x-ui ${PANEL_TAG} штатным установщиком..."
-    if ! XUI_NONINTERACTIVE=1 XUI_SSL_MODE=none XUI_USERNAME="$config_username" XUI_PASSWORD="$config_password" \
-         XUI_PANEL_PORT="$panel_port" XUI_WEB_BASE_PATH="$panel_path" XUI_ENABLE_FAIL2BAN=true \
-         bash "$installer" "$PANEL_TAG" </dev/null >"$log" 2>&1; then
+    XUI_NONINTERACTIVE=1 XUI_SSL_MODE=none XUI_USERNAME="$config_username" XUI_PASSWORD="$config_password" \
+        XUI_PANEL_PORT="$panel_port" XUI_WEB_BASE_PATH="$panel_path" XUI_ENABLE_FAIL2BAN=true \
+        bash "$installer" "$PANEL_TAG" </dev/null 2>&1 | tee "$log"
+    if (( PIPESTATUS[0] != 0 )); then
         rm -f "$installer"
-        tail -20 "$log"
         msg_err "Установка 3x-ui завершилась с ошибкой. Журнал: $log"
         return 1
     fi
@@ -1766,12 +1759,34 @@ RAW=https://raw.githubusercontent.com
 CDN=https://cdn.jsdelivr.net/gh
 failed=0
 
+# download NAME URL OUT: curl, with a [####*****] progress bar when run in a terminal.
+download() {
+    local name=$1 url=$2 out=$3 total pid size filled width=30 bar
+    [[ -t 1 ]] || { curl -fsSL --retry 3 --connect-timeout 15 --max-time 600 "$url" -o "$out"; return; }
+    total=$(curl -fsSLI --connect-timeout 15 "$url" | tr -d '\r' | awk 'tolower($1)=="content-length:" {v=$2} END {print v+0}')
+    curl -fsSL --retry 3 --connect-timeout 15 --max-time 600 "$url" -o "$out" &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        size=$(stat -c %s "$out" 2>/dev/null || echo 0)
+        if (( total > 0 )); then
+            filled=$(( size * width / total )); (( filled > width )) && filled=$width
+            printf -v bar '%*s' "$filled" ''; bar=${bar// /#}
+            printf -v size '%*s' $(( width - filled )) ''; bar+=${size// /*}
+            printf '\r  %-20s [%s] %3d%%' "$name" "$bar" $(( filled * 100 / width ))
+        fi
+        sleep 0.3
+    done
+    wait "$pid" || { printf '\n'; return 1; }
+    printf -v bar '%*s' "$width" ''
+    printf '\r  %-20s [%s] 100%%\n' "$name" "${bar// /#}"
+}
+
 # fetch NAME URL FALLBACK: download, reject HTML/short files, replace only on change.
 fetch() {
     local name=$1 tmp="$DEST/.$1.tmp" url size
     for url in "$2" "$3"; do
         rm -f "$tmp"
-        curl -fsSL --retry 3 --connect-timeout 15 --max-time 600 "$url" -o "$tmp" || continue
+        download "$name" "$url" "$tmp" || continue
         size=$(stat -c %s "$tmp")
         head -c 64 "$tmp" | tr -d '\0' | grep -qiE '<html|<!doctype|^Not Found|^404' && continue
         (( size >= 50000 )) || continue
@@ -2246,16 +2261,11 @@ show_results() {
     clear
     if systemctl is-active --quiet x-ui && systemctl is-active --quiet nginx && nginx -t >/dev/null 2>&1; then
         msg_inf "────────────────────────────────────────────────────────────────────────────────"
-        msg_inf "3x-ui ${PANEL_TAG:-}: https://${domain}/${panel_path}/\n"
+        echo -e "3x-ui ${PANEL_TAG:-}: https://${domain}/${panel_path}/\n"
         echo -e "Username:  ${config_username}\n"
         echo -e "Password:  ${config_password}\n"
         msg_inf "────────────────────────────────────────────────────────────────────────────────"
-        echo -e "Подписка:  https://${domain}/${sub_path}/<subId>"
-        echo -e "JSON:      https://${domain}/${json_path}/<subId>"
-        echo -e "Mihomo:    https://${domain}/mihomo/<subId>"
-        [[ "$DEPLOY_HY2" == 1 ]] && echo -e "Hysteria 2: ${domain}:${hy2_port}/udp"
         print_adguard_results
-        [[ -x "$GUARD_SELF" ]] && bash "$GUARD_SELF" -status y
         msg_inf "Please save this screen!"
         return 0
     fi
