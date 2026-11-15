@@ -65,7 +65,7 @@ GUARD_SELF="${LIB_DIR}/guard.sh"
 ADGUARD_INFO=/root/.3x-ui-auto-adguard-info
 
 # ─── Arguments ───────────────────────────────────────────────────────────────
-INSTALL=""; UNINSTALL=""; COMPONENTS_ONLY=""; PANEL_VERSION=""
+INSTALL=""; UNINSTALL=""; ADGUARD_ONLY=""; ADGUARD_UNINSTALL=""; PANEL_VERSION=""
 domain=""; DEPLOY_AGH=""; DNS_CHOICE=""; DEPLOY_HY2=""; DEPLOY_GUARD=""
 CUSTOM_DOH_URL=""; CUSTOM_DOH_HOST=""; CUSTOM_DOH_IP=""
 
@@ -74,7 +74,8 @@ usage() {
 Usage:
   bash 3x-ui-auto.sh -install y [-version v3.11.0]
   bash 3x-ui-auto.sh -uninstall y
-  bash 3x-ui-auto.sh -components y
+  bash 3x-ui-auto.sh -adguard y
+  bash 3x-ui-auto.sh -adguard-uninstall y
 EOF
 }
 
@@ -86,7 +87,8 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         -install)    require_arg_value "$@"; INSTALL="$2";         shift 2 ;;
         -uninstall)  require_arg_value "$@"; UNINSTALL="$2";       shift 2 ;;
-        -components) require_arg_value "$@"; COMPONENTS_ONLY="$2"; shift 2 ;;
+        -adguard)    require_arg_value "$@"; ADGUARD_ONLY="$2";    shift 2 ;;
+        -adguard-uninstall) require_arg_value "$@"; ADGUARD_UNINSTALL="$2"; shift 2 ;;
         -version)    require_arg_value "$@"; PANEL_VERSION="$2";   shift 2 ;;
         -h|--help)   usage; exit 0 ;;
         *)           msg_err "Unknown option: $1"; usage; exit 2 ;;
@@ -94,7 +96,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 _action_count=0
-for _v in "$INSTALL" "$UNINSTALL" "$COMPONENTS_ONLY"; do
+for _v in "$INSTALL" "$UNINSTALL" "$ADGUARD_ONLY" "$ADGUARD_UNINSTALL"; do
     [[ -z "$_v" || "$_v" == y ]] || { msg_err "Action options accept only the value: y"; usage; exit 2; }
     [[ "$_v" == y ]] && _action_count=$((_action_count + 1))
 done
@@ -424,8 +426,7 @@ save_firewall_state() {
 
 # The guard owns its rules and reloads them itself, so snapshots never carry them back.
 strip_guard_rules() {
-    sed -e '/^:\(XA_SCAN\|VH_GUARD\|VH_GUARD_SCAN\) /d' -e '/^-A \(XA_SCAN\|VH_GUARD\|VH_GUARD_SCAN\) /d' \
-        -e '/ -[jg] \(XA_SCAN\|VH_GUARD\|VH_GUARD_SCAN\)$/d' "$1"
+    sed -e '/^:\(XA_SCAN\|XA_TORRENT\) /d' -e '/^-A \(XA_SCAN\|XA_TORRENT\) /d' -e '/ -[jg] \(XA_SCAN\|XA_TORRENT\)$/d' "$1"
 }
 
 restore_firewall_state() {
@@ -824,8 +825,7 @@ setup_firewall() {
     [[ "$DEPLOY_HY2" == 1 && -n "$hy2_port" ]] && ufw allow "${hy2_port}/udp"
     ufw --force enable
     # ufw rebuilds INPUT: put the guard chains back on top right away.
-    [[ -x "$GUARD_SELF" ]] && "$GUARD_SELF" tick >/dev/null 2>&1 || true
-    [[ -x /usr/local/lib/vibehost-guard/guard.sh ]] && sh /usr/local/lib/vibehost-guard/guard.sh apply >/dev/null 2>&1 || true
+    [[ -x "$GUARD_SELF" ]] && "$GUARD_SELF" load >/dev/null 2>&1 || true
 }
 
 # ─── Panel (official 3x-ui installer, non-interactive) ───────────────────────
@@ -2324,56 +2324,6 @@ confirm_reinstall() {
     [[ "$answer" == 1 ]]
 }
 
-# ─── Components ──────────────────────────────────────────────────────────────
-component_status() {
-    case "$1" in
-        1)
-            if systemctl is-active --quiet AdGuardHome 2>/dev/null; then echo 'Активен'
-            elif [[ -d /opt/AdGuardHome ]]; then echo 'Установлен, неактивен'
-            else echo 'Не установлен'; fi ;;
-        2)
-            if [[ ! -x "$GUARD_SELF" ]]; then echo 'Не установлен'
-            elif iptables -w 2 -C INPUT -m conntrack --ctstate NEW -j XA_SCAN >/dev/null 2>&1 &&
-                 iptables -w 2 -S VH_GUARD >/dev/null 2>&1; then echo 'Активен'
-            else echo 'Установлен, неактивен'; fi ;;
-    esac
-}
-
-show_components() {
-    local number status names=('AdGuard Home' 'Защита от сканеров и торрентов')
-    msg_inf '────────────────────────────────────────────────────────────────────────────────'
-    msg_inf 'Компоненты'
-    for number in 1 2; do
-        status=$(component_status "$number")
-        if [[ "$status" == 'Активен' ]]; then msg_ok "  ${number}) ${names[number-1]} — ${status}"
-        else printf '  %s) %s — %s\n' "$number" "${names[number-1]}" "$status"; fi
-    done
-    msg_inf '────────────────────────────────────────────────────────────────────────────────'
-}
-
-components_menu() {
-    local action component result
-    [[ -f "$STATE_DIR/owned-by-3x-ui-auto" ]] || { msg_err 'Сначала установите панель через 3x-ui-auto.'; return 1; }
-    domain=$(head -1 "$STATE_DIR/domains")
-    echo
-    show_components
-    ask_choice action 'Действие:' 'Установить' 'Переустановить' 'Удалить' 'Отмена' || return 1
-    [[ "$action" != 4 ]] || { msg_inf 'Действие отменено. Компоненты не изменены.'; return 0; }
-    ask_choice component 'Компонент:' 'AdGuard Home' 'Защита от сканеров и торрентов' || return 1
-    case "$action:$component" in
-        3:1)
-            uninstall_adguard; result=$?
-            [[ "$result" == 2 ]] && return 0
-            [[ "$result" == 0 ]] || return 1 ;;
-        3:2) run_guard -uninstall && rm -f "$STATE_DIR/guard-installed" || return 1 ;;
-        1:1|2:1) install_adguard && print_adguard_results || return 1 ;;
-        1:2|2:2) run_guard -install && touch "$STATE_DIR/guard-installed" || return 1 ;;
-    esac
-    echo
-    msg_ok 'Выбранное действие выполнено.'
-    show_components
-}
-
 # ─── Main ────────────────────────────────────────────────────────────────────
 main() {
     local step
@@ -2407,9 +2357,16 @@ if [[ "$UNINSTALL" == y ]]; then
     exit 0
 fi
 
-if [[ "$COMPONENTS_ONLY" == y ]]; then
-    components_menu
-    exit $?
+if [[ "$ADGUARD_ONLY" == y || "$ADGUARD_UNINSTALL" == y ]]; then
+    [[ -f "$STATE_DIR/owned-by-3x-ui-auto" ]] || { msg_err 'Сначала установите панель через 3x-ui-auto.'; exit 1; }
+    domain=$(head -1 "$STATE_DIR/domains")
+    if [[ "$ADGUARD_UNINSTALL" == y ]]; then
+        uninstall_adguard
+        [[ $? != 1 ]] || exit 1
+        exit 0
+    fi
+    install_adguard && print_adguard_results || exit 1
+    exit 0
 fi
 
 if existing_install_detected; then

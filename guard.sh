@@ -1,6 +1,6 @@
 #!/bin/bash
-# 3x-ui-auto guard: blocks scanner subnets (ipset) and BitTorrent signatures (VibeHost Guard).
-# Lists refresh by atomic ipset swap; rules filter NEW connections only, so live sessions survive.
+# 3x-ui-auto guard: blocks scanner subnets (ipset) and BitTorrent traffic (string signatures).
+# Scanner lists refresh by atomic ipset swap and filter NEW connections only, so live sessions survive.
 
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l NEEDRESTART_SUSPEND=1 LC_ALL=C
 
@@ -20,10 +20,27 @@ SET4=xa-scan4
 SET6=xa-scan6
 MAXELEM=262144
 LIST_EVERY=21600   # scanner lists: 6 hours
-VH_EVERY=86400     # torrent signatures: 1 day
-VH_URL=https://raw.githubusercontent.com/VIBEHOST-LLC/vibehost-guard/master/guard.sh
-VH_LIB=/usr/local/lib/vibehost-guard
+SIG_EVERY=86400    # torrent signatures: 1 day
+TCHAIN=XA_TORRENT
+# Upstream signature source; only its SIGNATURES/UDP_TRACKER_HEX values are read, never executed.
+SIG_URL=https://raw.githubusercontent.com/VIBEHOST-LLC/vibehost-guard/master/guard.sh
+SIGFILE=$STATE/torrent-signatures
 UNITS=(3x-ui-guard.service 3x-ui-guard-tick.service 3x-ui-guard-tick.timer)
+
+# Built-in BitTorrent protocol markers, used until the first signature download succeeds.
+DEFAULT_SIGNATURES='bt-handshake|BitTorrent protocol
+dht-query|d1:ad2:id20:
+dht-reply|d1:rd2:id20:
+dht-get-peers|9:get_peers
+dht-announce|13:announce_peer
+dht-find-node|9:find_node
+tracker-info-hash|info_hash=
+tracker-peer-id|peer_id=
+tracker-announce|/announce?
+tracker-scrape|/scrape?
+lsd|BT-SEARCH
+magnet|urn:btih:
+udp-tracker|hex:|0000041727101980|'
 
 # rkn-guard + lucx-ui scanguard (shadow-netlab, C24Be, CyberOK) and remnanode-antiscan (greatlists).
 DEFAULT_SOURCES=(
@@ -189,68 +206,101 @@ remove_rules() {
     return 0
 }
 
-# ─── BitTorrent (VibeHost Guard) ─────────────────────────────────────────────
-vh() { env -u VH_GUARD_API -u VH_GUARD_LOCKED sh "$@"; }
+# ─── BitTorrent signatures ───────────────────────────────────────────────────
+# Signature lines: "name|text" for a plain string, "name|hex:|..|" for a hex string.
+current_signatures() {
+    if [[ -s "$SIGFILE" ]]; then cat "$SIGFILE"; else printf '%s\n' "$DEFAULT_SIGNATURES"; fi
+}
 
-install_torrent_guard() {
-    local installer
-    installer=$(mktemp) || return 1
-    if ! curl -fsSL --proto '=https' --connect-timeout 15 --max-time 180 "$VH_URL" -o "$installer" || ! sh -n "$installer"; then
-        rm -f "$installer"; echo "VibeHost Guard download failed" >&2; return 1
-    fi
-    # The DynamicUser analyser must traverse its binary directory.
-    install -d -m 0755 "$VH_LIB" &&
-        vh "$installer" </dev/null &&
-        systemctl enable --now vibehost-guard.service vibehost-guard-tick.timer &&
-        systemctl is-active --quiet vibehost-guard-tick.timer
+# fetch_signatures OUT: read the upstream SIGNATURES and UDP_TRACKER_HEX values as data.
+fetch_signatures() {
+    local src
+    src=$(mktemp) || return 1
+    curl -fsSL --proto '=https' --connect-timeout 15 --max-time 60 --max-filesize 1048576 "$SIG_URL" -o "$src" || { rm -f "$src"; return 1; }
+    python3 -I - "$src" "$1" <<'PY'
+import re, sys
+text = open(sys.argv[1], encoding='utf-8', errors='replace').read()
+block = re.search(r"^SIGNATURES='([^']*)'", text, re.M)
+udp = re.search(r"^UDP_TRACKER_HEX='(\|[0-9a-fA-F]+\|)'", text, re.M)
+if not block or not udp:
+    raise SystemExit('signature block not found')
+out = []
+for line in block.group(1).splitlines():
+    name, sep, pattern = line.partition('|')
+    if not sep or not re.fullmatch(r'[a-z0-9-]{1,40}', name) or not re.fullmatch(r'[\x21-\x7e][\x20-\x7e]{1,80}', pattern) or '"' in pattern:
+        raise SystemExit('unexpected signature line: %r' % line)
+    out.append(name + '|' + pattern)
+if not 5 <= len(out) <= 64:
+    raise SystemExit('unexpected signature count: %d' % len(out))
+out.append('udp-tracker|hex:' + udp.group(1))
+open(sys.argv[2], 'w').write('\n'.join(out) + '\n')
+PY
     local rc=$?
-    rm -f "$installer"
-    (( rc == 0 )) && date +%s >"$STATE/vh-updated"
+    rm -f "$src"
     return $rc
 }
 
-# Upstream only self-updates for enrolled servers, so pull new signatures ourselves.
-update_torrent_guard() {
-    local new
-    [[ -f "$VH_LIB/guard.sh" ]] || return 0
-    new=$(mktemp) || return 1
-    if curl -fsSL --proto '=https' --connect-timeout 15 --max-time 180 "$VH_URL" -o "$new" && sh -n "$new"; then
-        if ! cmp -s "$new" "$VH_LIB/guard.sh"; then
-            install -m 0755 "$new" "$VH_LIB/guard.sh.new" && mv -f "$VH_LIB/guard.sh.new" "$VH_LIB/guard.sh" &&
-                vh "$VH_LIB/guard.sh" apply && echo "VibeHost Guard signatures updated"
-        fi
-        date +%s >"$STATE/vh-updated"
-    fi
-    rm -f "$new"
+torrent_hooks() {
+    echo INPUT; echo OUTPUT; echo FORWARD
+    "$1" -w -n -L DOCKER-USER >/dev/null 2>&1 && echo DOCKER-USER
 }
 
-remove_torrent_guard() (
-    local cmd hook unit chain
-    for unit in vibehost-guard-tick.timer vibehost-guard-tick.service vibehost-guard-scan.path \
-                vibehost-guard-scan.service vibehost-guard-dpid.service vibehost-guard.service; do
-        [[ -f "/etc/systemd/system/$unit" ]] || continue
-        systemctl disable --now "$unit" >/dev/null 2>&1
+# ensure_torrent_rules [force]: rebuild the chain when its signature set changed, keep one jump per hook.
+ensure_torrent_rules() {
+    local cmd sigs tag name pattern hook n
+    sigs=$(current_signatures)
+    tag="xa-sig:$(printf '%s' "$sigs" | sha1sum | cut -c1-12)"
+    for cmd in iptables ip6tables; do
+        command -v "$cmd" >/dev/null 2>&1 || continue
+        if [[ "${1:-}" == force ]] || ! "$cmd" -w -S "$TCHAIN" 2>/dev/null | grep -q -- "$tag"; then
+            "$cmd" -w -N "$TCHAIN" 2>/dev/null || "$cmd" -w -F "$TCHAIN" || return 1
+            # Only the first 4 KB of a connection carry the handshakes; later traffic skips the scan.
+            "$cmd" -w -A "$TCHAIN" -m connbytes --connbytes 4097: --connbytes-dir both --connbytes-mode bytes \
+                -m comment --comment "$tag" -j RETURN || return 1
+            while IFS='|' read -r name pattern; do
+                [[ -n "$name" ]] || continue
+                if [[ "$pattern" == hex:* ]]; then
+                    "$cmd" -w -A "$TCHAIN" -p udp -m string --algo bm --hex-string "${pattern#hex:}" \
+                        -m comment --comment "xa:$name" -j DROP || return 1
+                else
+                    "$cmd" -w -A "$TCHAIN" -m string --algo bm --string "$pattern" \
+                        -m comment --comment "xa:$name" -j DROP || return 1
+                fi
+            done <<<"$sigs"
+        fi
+        for hook in $(torrent_hooks "$cmd"); do
+            n=$("$cmd" -w -S "$hook" | grep -c -- "-j $TCHAIN\$")
+            while (( n > 1 )); do "$cmd" -w -D "$hook" -j "$TCHAIN" || return 1; n=$((n - 1)); done
+            (( n == 1 )) || "$cmd" -w -I "$hook" 1 -j "$TCHAIN" || return 1
+        done
     done
-    # Share the upstream lock so a running check cannot recreate the chain during removal.
-    exec 9>/run/vibehost-guard.lock && flock -w 60 9 || return 1
+}
+
+remove_torrent_rules() {
+    local cmd hook
     for cmd in iptables ip6tables; do
         command -v "$cmd" >/dev/null 2>&1 || continue
         for hook in INPUT OUTPUT FORWARD DOCKER-USER; do
-            while "$cmd" -w -C "$hook" -j VH_GUARD >/dev/null 2>&1; do
-                "$cmd" -w -D "$hook" -j VH_GUARD || return 1
-            done
+            while "$cmd" -w -C "$hook" -j "$TCHAIN" 2>/dev/null; do "$cmd" -w -D "$hook" -j "$TCHAIN" || return 1; done
         done
-        for chain in VH_GUARD VH_GUARD_SCAN; do
-            if "$cmd" -w -S "$chain" >/dev/null 2>&1; then
-                "$cmd" -w -F "$chain" && "$cmd" -w -X "$chain" || return 1
-            fi
-        done
+        if "$cmd" -w -S "$TCHAIN" >/dev/null 2>&1; then
+            "$cmd" -w -F "$TCHAIN" && "$cmd" -w -X "$TCHAIN" || return 1
+        fi
     done
-    rm -f /etc/systemd/system/vibehost-guard{,-dpid,-scan,-tick}.service \
-          /etc/systemd/system/vibehost-guard-scan.path /etc/systemd/system/vibehost-guard-tick.timer \
-          /etc/cron.d/vibehost-guard
-    rm -rf -- "$VH_LIB" /etc/vibehost-guard
-)
+}
+
+# Daily: take new signatures only when they parse cleanly; otherwise keep the current set.
+update_signatures() {
+    local new
+    new=$(mktemp) || return 1
+    if fetch_signatures "$new"; then
+        if ! cmp -s "$new" "$SIGFILE"; then
+            install -m 0600 "$new" "$SIGFILE" && echo "torrent signatures updated"
+        fi
+        date +%s >"$STATE/sig-updated"
+    fi
+    rm -f "$new"
+}
 
 # ─── Lifecycle ───────────────────────────────────────────────────────────────
 lock() { exec 8>/run/3x-ui-guard.lock && flock -w 120 8; }
@@ -265,7 +315,7 @@ older_than() {
 # Boot: restore sets from cache and hook the chain, no network needed.
 cmd_load() {
     lock || return 1
-    refresh_lists && ensure_rules
+    refresh_lists && ensure_rules && ensure_torrent_rules
 }
 
 # Every 5 minutes: keep rules in place; refresh lists and signatures when due.
@@ -273,8 +323,9 @@ cmd_tick() {
     lock || return 1
     if ! ipset list -n "$SET4" >/dev/null 2>&1; then refresh_lists || true; fi
     if older_than "$STATE/updated" "$LIST_EVERY"; then refresh_lists download || true; fi
+    if older_than "$STATE/sig-updated" "$SIG_EVERY"; then update_signatures || true; fi
     ensure_rules
-    if older_than "$STATE/vh-updated" "$VH_EVERY"; then update_torrent_guard || true; fi
+    ensure_torrent_rules
 }
 
 install_units() {
@@ -347,11 +398,11 @@ cmd_install() {
     read -r -a counts <"$STATE/counts"
     msg_ok "Защита от сканеров включена: IPv4 подсетей ${counts[0]}, IPv6 подсетей ${counts[1]:-0}."
 
-    msg_inf "Устанавливаю защиту от торрентов (VibeHost Guard)..."
-    if ! install_torrent_guard >>"$LOG" 2>&1; then
+    msg_inf "Включаю защиту от торрентов..."
+    if ! update_signatures >>"$LOG" 2>&1 || ! ensure_torrent_rules force >>"$LOG" 2>&1; then
         msg_err "Не удалось установить защиту от торрентов. Журнал: $LOG"; return 1
     fi
-    msg_ok "Защита от торрентов включена: сигнатуры BitTorrent/DHT, проверка правил каждые 5 минут."
+    msg_ok "Защита от торрентов включена: $(current_signatures | grep -c '|') сигнатур BitTorrent/DHT и трекеров."
     exec 8>&-
 
     install_units || { msg_err "Не удалось включить автообновление защиты."; return 1; }
@@ -364,7 +415,7 @@ cmd_uninstall() {
     for unit in "${UNITS[@]}"; do systemctl disable --now "$unit" >/dev/null 2>&1; done
     rm -f "${UNITS[@]/#//etc/systemd/system/}"
     remove_rules || { msg_err "Не удалось удалить правила защиты от сканеров."; return 1; }
-    remove_torrent_guard || { msg_err "Не удалось полностью удалить защиту от торрентов."; return 1; }
+    remove_torrent_rules || { msg_err "Не удалось полностью удалить защиту от торрентов."; return 1; }
     systemctl daemon-reload
     systemctl reset-failed >/dev/null 2>&1
     rm -rf -- "$STATE" "$SOURCES" "$SELF"
@@ -381,8 +432,8 @@ cmd_status() {
     else
         msg_err "Сканеры: не активна"
     fi
-    if iptables -w -S VH_GUARD >/dev/null 2>&1; then
-        msg_ok "Торренты: активна ($(iptables -w -S VH_GUARD | grep -c 'vh:') сигнатур)"
+    if iptables -w -C INPUT -j "$TCHAIN" 2>/dev/null; then
+        msg_ok "Торренты: активна ($(iptables -w -S "$TCHAIN" | grep -c 'xa:') сигнатур)"
     else
         msg_err "Торренты: не активна"
     fi

@@ -55,18 +55,21 @@ curl -fsSL https://raw.githubusercontent.com/ttrroyy/3x-ui-auto/main/3x-ui-auto.
 
 ---
 
-## Компоненты
+## AdGuard Home
+
+DoH: `https://<домен>/dns-query`, админка на случайном пути `/adg-<random>/`. Ставится на уже установленную панель. Настройки и пароль сохраняются при повторной установке. Если Xray использует этот DoH, удаление потребует подтверждения.
+
+**Установить**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ttrroyy/3x-ui-auto/main/3x-ui-auto.sh -o /root/3x-ui-auto.sh && bash /root/3x-ui-auto.sh -components y
+curl -fsSL https://raw.githubusercontent.com/ttrroyy/3x-ui-auto/main/3x-ui-auto.sh -o /root/3x-ui-auto.sh && bash /root/3x-ui-auto.sh -adguard y
 ```
 
-Выберите **Установить**, **Переустановить** или **Удалить**, затем компонент. В меню видно, какие компоненты активны.
+**Удалить**
 
-| Компонент | Описание |
-|-----------|----------|
-| [AdGuard Home](https://github.com/AdguardTeam/AdGuardHome) | DoH: `https://<домен>/dns-query`, админка на случайном пути `/adg-<random>/`. Настройки и пароль сохраняются при переустановке. Если Xray использует этот DoH, удаление потребует подтверждения. |
-| Защита от сканеров и торрентов | То же, что отдельный скрипт защиты ниже. |
+```bash
+curl -fsSL https://raw.githubusercontent.com/ttrroyy/3x-ui-auto/main/3x-ui-auto.sh -o /root/3x-ui-auto.sh && bash /root/3x-ui-auto.sh -adguard-uninstall y
+```
 
 ---
 
@@ -77,7 +80,7 @@ curl -fsSL https://raw.githubusercontent.com/ttrroyy/3x-ui-auto/main/3x-ui-auto.
 | Защита | Описание |
 |--------|----------|
 | От сканеров | Блокирует новые входящие соединения из подсетей сканеров РКН и госсетей. Источники списков: [rkn-guard](https://github.com/Flecksis/rkn-guard), [remnanode-antiscan](https://github.com/HikaruApps/remnanode-antiscan) и [lucx-ui](https://github.com/AlexeyLCP/lucx-ui). SSH-порт не блокируется. |
-| [VibeHost Guard](https://github.com/VIBEHOST-LLC/vibehost-guard) | Блокировка торрент-трафика по сигнатурам BitTorrent/DHT, без ключа и регистрации. Зашифрованный BitTorrent может не распознаваться. |
+| От торрентов | Блокирует BitTorrent, DHT, трекеры и magnet-ссылки по сигнатурам в первых 4 КБ соединения: входящий, исходящий и транзитный трафик, в том числе трафик клиентов через Xray. Зашифрованный BitTorrent может не распознаваться. |
 
 Списки сканеров обновляются каждые 6 часов, сигнатуры торрентов раз в сутки. Обновление атомарно подменяет списки в ядре, без перезапуска служб и без разрыва текущих соединений. Если источник недоступен, вернул мусор или сократился больше чем вдвое, остаётся его прошлая копия. Правила проверяются каждые 5 минут и восстанавливаются после перезагрузки.
 
@@ -110,7 +113,8 @@ bash /usr/local/lib/3x-ui-auto/guard.sh -status y
 | `-install y` | Полная установка |
 | `-version <версия>` | Версия 3x-ui для установки, например `v3.11.0`, по умолчанию последняя |
 | `-uninstall y` | Полное удаление с сохранением сертификатов |
-| `-components y` | Меню установки, переустановки и удаления компонентов |
+| `-adguard y` | Установить AdGuard Home на установленную панель |
+| `-adguard-uninstall y` | Удалить AdGuard Home |
 
 ---
 

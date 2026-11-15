@@ -17,7 +17,7 @@ BACKUP_PATHS=(
     /etc/letsencrypt /var/lib/letsencrypt /root/cert
     /var/www/html /var/www/subpage
     /opt/AdGuardHome /root/.3x-ui-auto-adguard-info
-    /var/lib/3x-ui-auto /etc/3x-ui-auto /usr/local/lib/vibehost-guard /etc/vibehost-guard
+    /var/lib/3x-ui-auto /etc/3x-ui-auto
     /etc/sysctl.conf /etc/sysctl.d/99-bbr-x-ui.conf /etc/sysctl.d/99-zz-3x-ui-auto-tuning.conf
     /etc/modules-load.d/3x-ui-auto-network.conf
     /etc/logrotate.d/nginx /etc/systemd/journald.conf.d/99-3x-ui-auto-logs.conf
@@ -29,12 +29,10 @@ SYSTEMD_UNITS=(
     xa-apply-qdisc.service xa-qdisc-sync.service xa-qdisc-sync.path
     xa-log-policy.service xa-log-policy.timer xa-geo-update.service xa-geo-update.timer
     3x-ui-guard.service 3x-ui-guard-tick.service 3x-ui-guard-tick.timer
-    vibehost-guard.service vibehost-guard-dpid.service vibehost-guard-tick.service vibehost-guard-tick.timer
-    vibehost-guard-scan.path vibehost-guard-scan.service
 )
 # Services whose enabled/active state is recorded and replayed, in start order.
 SERVICES=(x-ui nginx xa-clash-sub AdGuardHome fail2ban xa-apply-qdisc xa-qdisc-sync.path xa-log-policy.timer xa-geo-update.timer
-          3x-ui-guard 3x-ui-guard-tick.timer vibehost-guard vibehost-guard-tick.timer)
+          3x-ui-guard 3x-ui-guard-tick.timer)
 
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -212,7 +210,6 @@ cmd_restore() {
     if [[ "$(cat "${staging}/ufw-state" 2>/dev/null)" == active ]]; then ufw --force enable >/dev/null; else ufw --force disable >/dev/null; fi
     # ufw rebuilds INPUT: put the guard chains back on top.
     [[ -x /usr/local/lib/3x-ui-auto/guard.sh ]] && /usr/local/lib/3x-ui-auto/guard.sh load || true
-    [[ -x /usr/local/lib/vibehost-guard/guard.sh ]] && sh /usr/local/lib/vibehost-guard/guard.sh apply || true
     [[ -s "${staging}/root-crontab" ]] && crontab "${staging}/root-crontab"
     if crontab -l 2>/dev/null | grep -q 'certbot renew'; then
         systemctl enable --now cron >/dev/null 2>&1 || true
