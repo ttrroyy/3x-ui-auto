@@ -1499,8 +1499,9 @@ clients = json.dumps({"clients": [], "decryption": "none", "encryption": "none",
 reality = {
     "network": "tcp", "security": "reality",
     "realitySettings": {
-        "show": False, "xver": 0, "target": "127.0.0.1:9443", "serverNames": ["${domain}"],
-        "privateKey": "${private_key}", "minClient": "", "maxClient": "", "maxTimediff": 0,
+        # One domain: non-REALITY TLS falls through to the nginx site on 7443 with PROXY protocol.
+        "show": False, "xver": 1, "target": "127.0.0.1:7443", "serverNames": ["${domain}"],
+        "privateKey": "${private_key}", "minClientVer": "", "maxClientVer": "", "maxTimediff": 0,
         "shortIds": "${shor[*]}".split(),
         "settings": {"publicKey": "${public_key}", "fingerprint": "firefox", "serverName": "", "spiderX": "/"},
     },
@@ -1519,13 +1520,18 @@ for tag, remark, port, stream in (("inbound-8443", "tcp-reality", 8443, reality)
         " VALUES (1, 0, 0, 0, ?, 1, 0, '127.0.0.1', ?, 'vless', ?, ?, ?, ?)",
         ("%s %s" % (flag, remark), port, clients, json.dumps(stream, indent=2), tag, sniffing))
     ids[tag] = cur.lastrowid
-hosts = (
-    (ids["inbound-8443"], "${gid_reality:=$(gen_group_id)}", "tcp-reality", "${domain}", 443, "same", "", "[]", "", ""),
-    (ids["inbound-10080"], "${gid_xhttp:=$(gen_group_id)}", "xhttp-tls", "${domain}", 443, "tls", "firefox", '["h2","http/1.1"]', "${domain}", "${domain}"),
-)
-db.executemany(
-    "INSERT INTO hosts (inbound_id, group_id, sort_order, remark, address, port, security, fingerprint, alpn, sni, host_header)"
-    " VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)", hosts)
+columns = {r[1] for r in db.execute("PRAGMA table_info(hosts)")}
+for inbound_id, group_id, remark, xhttp_host in ((ids["inbound-8443"], "$(gen_group_id)", "tcp-reality", False),
+                                                  (ids["inbound-10080"], "$(gen_group_id)", "xhttp-tls", True)):
+    host = {"inbound_id": inbound_id, "group_id": group_id, "sort_order": 0, "remark": remark,
+            "address": "${domain}", "port": 443, "security": "tls" if xhttp_host else "same",
+            "fingerprint": "firefox" if xhttp_host else "", "alpn": '["h2","http/1.1"]' if xhttp_host else "[]",
+            "sni": "${domain}", "host_header": "${domain}" if xhttp_host else "", "path": "", "cipher_suites": "",
+            "override_sni_from_address": 0, "keep_sni_blank": 0, "pinned_peer_cert_sha256": "[]",
+            "verify_peer_cert_by_name": "", "allow_insecure": 0, "ech_config_list": "", "mux_params": "",
+            "sockopt_params": "", "final_mask": "", "vless_route": "", "snis": "[]", "sni_shared_random": 0}
+    host = {k: v for k, v in host.items() if k in columns}
+    db.execute("INSERT INTO hosts (%s) VALUES (%s)" % (",".join(host), ",".join("?" * len(host))), list(host.values()))
 db.commit()
 db.close()
 PY_XA_DB
@@ -1645,7 +1651,7 @@ stream = {
         "rejectUnknownSni": False, "disableSystemRoot": False, "enableSessionResumption": False, "alpn": ["h3"],
         "certificates": [{"useFile": True, "certificateFile": cert, "keyFile": key, "certificate": [], "key": [],
                           "ocspStapling": 0, "oneTimeLoading": False, "usage": "encipherment", "buildChain": False}],
-        "settings": {"fingerprint": "firefox", "echConfigList": "", "pinnedPeerCertSha256": [], "verifyPeerCertByName": ""},
+        "settings": {"fingerprint": "", "echConfigList": "", "pinnedPeerCertSha256": [], "verifyPeerCertByName": ""},
     },
     "finalmask": {"tcp": [], "udp": [{"type": "salamander", "settings": {"password": salamander}}]},
 }
