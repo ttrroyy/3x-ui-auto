@@ -1750,6 +1750,79 @@ cleanup_cover_site() {
     cover cleanup
 }
 
+# ─── Extra geodata: ROSCOM and RUNET next to the stock files ─────────────────
+GEO_UPDATER="${LIB_DIR}/geo-update.sh"
+
+install_extra_geo() {
+    install -d -m 0755 "$LIB_DIR"
+    cat > "$GEO_UPDATER" <<'XA_GEO_UPDATE'
+#!/bin/bash
+# Keeps geoip/geosite ROSCOM and RUNET in the panel bin folder; restarts xray only when a file changed.
+set -u
+DEST=/usr/local/x-ui/bin
+GH=https://github.com
+RAW=https://raw.githubusercontent.com
+CDN=https://cdn.jsdelivr.net/gh
+changed=0 failed=0
+
+# fetch NAME URL FALLBACK: download, reject HTML/short files, replace only on change.
+fetch() {
+    local name=$1 tmp="$DEST/.$1.tmp" url size
+    for url in "$2" "$3"; do
+        rm -f "$tmp"
+        curl -fsSL --retry 3 --connect-timeout 15 --max-time 600 "$url" -o "$tmp" || continue
+        size=$(stat -c %s "$tmp")
+        head -c 64 "$tmp" | tr -d '\0' | grep -qiE '<html|<!doctype|^Not Found|^404' && continue
+        (( size >= 50000 )) || continue
+        if cmp -s "$tmp" "$DEST/$name"; then rm -f "$tmp"; echo "$name: up to date"; return 0; fi
+        chmod 0644 "$tmp" && mv -f "$tmp" "$DEST/$name" && changed=1 && echo "$name: updated ($size bytes)" && return 0
+    done
+    rm -f "$tmp"
+    echo "$name: download failed, keeping the current file" >&2
+    failed=1
+}
+
+[[ -d "$DEST" ]] || exit 0
+fetch geoip_ROSCOM.dat "$GH/hydraponique/roscomvpn-geoip/releases/latest/download/geoip.dat" "$CDN/hydraponique/roscomvpn-geoip/release/geoip.dat"
+fetch geosite_ROSCOM.dat "$GH/hydraponique/roscomvpn-geosite/releases/latest/download/geosite.dat" "$CDN/hydraponique/roscomvpn-geosite/release/geosite.dat"
+fetch geoip_RUNET.dat "$RAW/runetfreedom/russia-v2ray-rules-dat/release/geoip.dat" "$GH/runetfreedom/russia-v2ray-rules-dat/raw/release/geoip.dat"
+fetch geosite_RUNET.dat "$RAW/runetfreedom/russia-v2ray-rules-dat/release/geosite.dat" "$GH/runetfreedom/russia-v2ray-rules-dat/raw/release/geosite.dat"
+# Xray reads geodata only at start.
+if (( changed )) && [[ "${1:-}" == --restart ]] && systemctl is-active --quiet x-ui; then
+    systemctl restart x-ui
+fi
+exit $failed
+XA_GEO_UPDATE
+    chmod 0755 "$GEO_UPDATER"
+    cat > /etc/systemd/system/xa-geo-update.service <<EOF
+[Unit]
+Description=Update ROSCOM and RUNET geodata for 3x-ui
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${GEO_UPDATER} --restart
+EOF
+    # Weekly, at night, like the stock geodata schedule of lucx-ui-pro.
+    cat > /etc/systemd/system/xa-geo-update.timer <<'EOF'
+[Unit]
+Description=Weekly ROSCOM and RUNET geodata update
+
+[Timer]
+OnCalendar=Sun *-*-* 04:00:00
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    msg_inf "Загружаю гео ROSCOM и RUNET..."
+    "$GEO_UPDATER" || { msg_err "Не удалось загрузить гео ROSCOM/RUNET."; return 1; }
+    systemctl daemon-reload && systemctl enable --now xa-geo-update.timer >/dev/null 2>&1 || return 1
+    msg_ok "Гео ROSCOM и RUNET установлены, обновление раз в неделю."
+}
+
 # ─── AdGuard Home ────────────────────────────────────────────────────────────
 uninstall_adguard() {
     local quiet="${1:-}" had_adguard=0 dns_state answer
@@ -2214,6 +2287,7 @@ uninstall_xui() {
         uninstall_adguard quiet || msg_err "Не удалось полностью удалить AdGuard Home."
     fi
     msg_inf "Отключаю службы и удаляю задание продления сертификата..."
+    systemctl disable --now xa-geo-update.timer 2>/dev/null || true
     systemctl disable x-ui AdGuardHome xa-clash-sub xa-apply-qdisc xa-qdisc-sync.path 2>/dev/null || true
     remove_cron_job
     # fail2ban jail and filters installed by the panel's own setup.
@@ -2224,6 +2298,7 @@ uninstall_xui() {
     rm -f /usr/bin/x-ui /etc/systemd/system/x-ui.service /etc/systemd/system/AdGuardHome.service \
           /etc/systemd/system/xa-clash-sub.service /etc/systemd/system/xa-apply-qdisc.service \
           /etc/systemd/system/xa-qdisc-sync.service /etc/systemd/system/xa-qdisc-sync.path \
+          /etc/systemd/system/xa-geo-update.service /etc/systemd/system/xa-geo-update.timer "$GEO_UPDATER" \
           /usr/local/sbin/xa-apply-qdisc "${LIB_DIR}/clash-sub-server.py" "${LIB_DIR}/log-policy.py" \
           /etc/x-ui/.xa-bbr-restore /var/log/3x-ui-auto-panel-install.log
     rm -f "/etc/nginx/sites-enabled/$(cat "$dir/domains")" "/etc/nginx/sites-available/$(cat "$dir/domains")" \
@@ -2312,7 +2387,7 @@ main() {
     : > "$INSTALL_IN_PROGRESS_FILE"
     for step in install_packages get_ssl_certs setup_firewall install_panel install_clash_subscription \
                 configure_nginx "run_log_policy install" configure_xui_db apply_xray_template insert_hy2_inbound \
-                install_cover_site tune_system patch_panel_bbr_script setup_cron; do
+                install_cover_site install_extra_geo tune_system patch_panel_bbr_script setup_cron; do
         $step || return 1
     done
     if [[ "$DEPLOY_AGH" == 1 ]]; then install_adguard || return 1; fi

@@ -20,7 +20,8 @@ VLESS TCP REALITY и VLESS XHTTP TLS работают через порт 443, [
 | AdGuard Home | По желанию: self-hosted DNS с блокировкой рекламы (DoH) |
 | Защита от сканеров и торрентов | По желанию, см. ниже |
 | [fail2ban](https://github.com/fail2ban/fail2ban) | Для IP Limit панели, настраивается самой 3x-ui |
-| BBR + FQ, UFW | Настройка сети и firewall |
+| Гео ROSCOM и RUNET | `geoip_ROSCOM.dat`, `geosite_ROSCOM.dat` ([hydraponique](https://github.com/hydraponique)) и `geoip_RUNET.dat`, `geosite_RUNET.dat` ([runetfreedom](https://github.com/runetfreedom/russia-v2ray-rules-dat)) рядом со стандартными файлами панели. Обновляются раз в неделю, в воскресенье ночью; xray перезапускается, только если файлы изменились. Обновление панели их не удаляет. |
+| BBR + FQ, UFW | Настройка сети и firewall. BBR включается и выключается в меню `x-ui`, выбор сохраняется после перезагрузки |
 
 ---
 

@@ -27,13 +27,13 @@ BACKUP_PATHS=(
 SYSTEMD_UNITS=(
     x-ui.service xa-clash-sub.service AdGuardHome.service
     xa-apply-qdisc.service xa-qdisc-sync.service xa-qdisc-sync.path
-    xa-log-policy.service xa-log-policy.timer
+    xa-log-policy.service xa-log-policy.timer xa-geo-update.service xa-geo-update.timer
     3x-ui-guard.service 3x-ui-guard-tick.service 3x-ui-guard-tick.timer
     vibehost-guard.service vibehost-guard-dpid.service vibehost-guard-tick.service vibehost-guard-tick.timer
     vibehost-guard-scan.path vibehost-guard-scan.service
 )
 # Services whose enabled/active state is recorded and replayed, in start order.
-SERVICES=(x-ui nginx xa-clash-sub AdGuardHome fail2ban xa-apply-qdisc xa-qdisc-sync.path xa-log-policy.timer
+SERVICES=(x-ui nginx xa-clash-sub AdGuardHome fail2ban xa-apply-qdisc xa-qdisc-sync.path xa-log-policy.timer xa-geo-update.timer
           3x-ui-guard 3x-ui-guard-tick.timer vibehost-guard vibehost-guard-tick.timer)
 
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
