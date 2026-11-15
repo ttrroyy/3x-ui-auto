@@ -1757,13 +1757,14 @@ install_extra_geo() {
     install -d -m 0755 "$LIB_DIR"
     cat > "$GEO_UPDATER" <<'XA_GEO_UPDATE'
 #!/bin/bash
-# Keeps geoip/geosite ROSCOM and RUNET in the panel bin folder; restarts xray only when a file changed.
+# Keeps geoip/geosite ROSCOM and RUNET in the panel bin folder. Never restarts xray: it reads geodata
+# at start, so new files apply at the next x-ui restart (certificate renewal, panel update, settings change).
 set -u
 DEST=/usr/local/x-ui/bin
 GH=https://github.com
 RAW=https://raw.githubusercontent.com
 CDN=https://cdn.jsdelivr.net/gh
-changed=0 failed=0
+failed=0
 
 # fetch NAME URL FALLBACK: download, reject HTML/short files, replace only on change.
 fetch() {
@@ -1775,7 +1776,7 @@ fetch() {
         head -c 64 "$tmp" | tr -d '\0' | grep -qiE '<html|<!doctype|^Not Found|^404' && continue
         (( size >= 50000 )) || continue
         if cmp -s "$tmp" "$DEST/$name"; then rm -f "$tmp"; echo "$name: up to date"; return 0; fi
-        chmod 0644 "$tmp" && mv -f "$tmp" "$DEST/$name" && changed=1 && echo "$name: updated ($size bytes)" && return 0
+        chmod 0644 "$tmp" && mv -f "$tmp" "$DEST/$name" && echo "$name: updated ($size bytes)" && return 0
     done
     rm -f "$tmp"
     echo "$name: download failed, keeping the current file" >&2
@@ -1787,10 +1788,6 @@ fetch geoip_ROSCOM.dat "$GH/hydraponique/roscomvpn-geoip/releases/latest/downloa
 fetch geosite_ROSCOM.dat "$GH/hydraponique/roscomvpn-geosite/releases/latest/download/geosite.dat" "$CDN/hydraponique/roscomvpn-geosite/release/geosite.dat"
 fetch geoip_RUNET.dat "$RAW/runetfreedom/russia-v2ray-rules-dat/release/geoip.dat" "$GH/runetfreedom/russia-v2ray-rules-dat/raw/release/geoip.dat"
 fetch geosite_RUNET.dat "$RAW/runetfreedom/russia-v2ray-rules-dat/release/geosite.dat" "$GH/runetfreedom/russia-v2ray-rules-dat/raw/release/geosite.dat"
-# Xray reads geodata only at start.
-if (( changed )) && [[ "${1:-}" == --restart ]] && systemctl is-active --quiet x-ui; then
-    systemctl restart x-ui
-fi
 exit $failed
 XA_GEO_UPDATE
     chmod 0755 "$GEO_UPDATER"
@@ -1802,7 +1799,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=${GEO_UPDATER} --restart
+ExecStart=${GEO_UPDATER}
 EOF
     # Weekly, at night, like the stock geodata schedule of lucx-ui-pro.
     cat > /etc/systemd/system/xa-geo-update.timer <<'EOF'
