@@ -1,5 +1,5 @@
 #!/bin/bash
-# Scanner subnet and BitTorrent firewall using a dedicated nftables table.
+# Scanner subnet firewall using a dedicated nftables table.
 
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l NEEDRESTART_SUSPEND=1 LC_ALL=C
 
@@ -149,25 +149,9 @@ table inet $TABLE {
     set scanners6 { type ipv6_addr; flags interval; }
     chain input {
         type filter hook input priority -10; policy accept;
-        jump torrent
         ct state new tcp dport { $ssh } return
         ct state new fib saddr type != local ip saddr @scanners4 counter drop
         ct state new fib saddr type != local ip6 saddr @scanners6 counter drop
-    }
-    chain output {
-        type filter hook output priority -10; policy accept;
-        jump torrent
-    }
-    chain forward {
-        type filter hook forward priority -10; policy accept;
-        jump torrent
-    }
-    chain torrent {
-        # shortcut: fixed payload fields only, use a flow classifier for reassembly.
-        meta l4proto tcp @ih,0,64 0x13426974546f7272 @ih,64,96 0x656e742070726f746f636f6c counter drop comment "bt-handshake"
-        meta l4proto udp @ih,0,88 0x64313a6164323a69643230 @ih,88,8 0x3a counter drop comment "dht-query"
-        meta l4proto udp @ih,0,88 0x64313a7264323a69643230 @ih,88,8 0x3a counter drop comment "dht-reply"
-        meta l4proto udp @ih,0,96 0x000004172710198000000000 counter drop comment "udp-tracker"
     }
 }
 $elements4
@@ -298,7 +282,7 @@ cmd_install() {
     msg_ok "Защита от сканеров включена: IPv4 подсетей ${counts[0]}, IPv6 подсетей ${counts[1]:-0}."
 
     install_units || { msg_err "Не удалось включить автообновление защиты."; return 1; }
-    msg_ok "Внешние списки подсетей проверяются каждые 6 часов. BitTorrent-правила встроены в guard.sh."
+    msg_ok "Внешние списки подсетей проверяются каждые 6 часов."
 }
 
 stop_units() {
@@ -306,7 +290,7 @@ stop_units() {
     for unit in "${UNITS[2]}" "${UNITS[1]}" "${UNITS[0]}"; do
         if [[ -f "/etc/systemd/system/$unit" ]]; then
             systemctl stop "$unit" || return 1
-            if systemctl is-enabled --quiet "$unit"; then
+            if [[ "$(systemctl is-enabled "$unit" 2>/dev/null)" == enabled ]]; then
                 systemctl disable "$unit" >/dev/null || return 1
             fi
         fi
@@ -326,7 +310,7 @@ cmd_uninstall() {
     stop_units && lock && clear_runtime || return 1
     rm -f -- "$SOURCES" "$ALLOW" "$SELF" "$SELF.new" "$LOG" || return 1
     rmdir "$CONF_DIR" "$LIB" /var/lib/3x-ui-auto 2>/dev/null
-    msg_ok "Защита от сканеров и торрентов удалена. Остальные правила firewall не изменены."
+    msg_ok "Защита от сканеров удалена."
 }
 
 cmd_status() {
@@ -351,6 +335,11 @@ main() {
         -install)   cmd_install ;;
         -uninstall) cmd_uninstall ;;
         -status)    cmd_status ;;
+        split)
+            lock || return 1
+            nft list chain inet "$TABLE" torrent >/dev/null 2>&1 || return 0
+            install_self && { refresh_lists || refresh_lists download; }
+            ;;
         load)       cmd_load ;;
         tick)       cmd_tick ;;
         *)          usage; return 1 ;;

@@ -10,7 +10,7 @@ umask 077
 
 BACKUP_STORE="/var/backups/x-ui"
 REPO_RAW=https://raw.githubusercontent.com/ttrroyy/3x-ui-auto/main
-PACKAGES="ca-certificates curl wget jq bash sudo openssl nginx-full certbot python3-certbot-nginx sqlite3 nftables python3 cron iproute2 fail2ban logrotate tar psmisc"
+PACKAGES="ca-certificates curl wget jq bash sudo openssl nginx-full certbot python3-certbot-nginx sqlite3 nftables libmnl0 python3 cron iproute2 fail2ban logrotate tar psmisc"
 
 BACKUP_PATHS=(
     /etc/nginx /etc/x-ui /etc/default/x-ui /etc/fail2ban /etc/cron.d
@@ -28,11 +28,11 @@ SYSTEMD_UNITS=(
     x-ui.service xa-clash-sub.service AdGuardHome.service
     xa-apply-qdisc.service xa-qdisc-sync.service xa-qdisc-sync.path
     xa-log-policy.service xa-log-policy.timer xa-geo-update.service xa-geo-update.timer
-    3x-ui-auto-firewall.service 3x-ui-guard.service 3x-ui-guard-tick.service 3x-ui-guard-tick.timer
+    3x-ui-auto-firewall.service 3x-ui-guard.service 3x-ui-guard-dpi.service 3x-ui-guard-tick.service 3x-ui-guard-tick.timer
 )
 # Services whose enabled/active state is recorded and replayed, in start order.
 SERVICES=(3x-ui-auto-firewall x-ui nginx xa-clash-sub AdGuardHome fail2ban xa-apply-qdisc xa-qdisc-sync.path xa-log-policy.timer xa-geo-update.timer
-          3x-ui-guard 3x-ui-guard-tick.timer)
+          3x-ui-guard 3x-ui-guard-dpi 3x-ui-guard-tick.timer)
 
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -200,6 +200,13 @@ cmd_restore() {
         bash /usr/local/lib/3x-ui-auto/guard.sh -uninstall y
     elif nft list table inet xa_guard >/dev/null 2>&1; then
         nft delete table inet xa_guard
+    fi
+    if nft list table inet xa_torrent >/dev/null 2>&1; then
+        nft delete table inet xa_torrent
+    fi
+    if [[ -f /etc/systemd/system/3x-ui-guard-dpi.service ]]; then
+        systemctl disable 3x-ui-guard-dpi.service
+        rm -f /etc/systemd/system/3x-ui-guard-dpi.service
     fi
 
     blue "==> Restoring files..."

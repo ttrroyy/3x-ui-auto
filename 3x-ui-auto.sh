@@ -58,12 +58,13 @@ COVER_ROOT=/var/www/3x-ui-auto-cover
 COVER_STATE="${STATE_DIR}/cover-generator-v2.json"
 INSTALL_IN_PROGRESS_FILE="${STATE_DIR}/install-in-progress"
 GUARD_SELF="${LIB_DIR}/guard.sh"
+TORRENT_SELF="${LIB_DIR}/torrent.sh"
 ADGUARD_INFO=/root/.3x-ui-auto-adguard-info
 
 # ─── Arguments ───────────────────────────────────────────────────────────────
 INSTALL=""; UNINSTALL=""; ADGUARD_ONLY=""; ADGUARD_UNINSTALL=""; PANEL_VERSION=""
-GUARD_ACTION=""; BACKUP_ACTION=""; BACKUP_FILE=""
-domain=""; DEPLOY_AGH=""; DNS_CHOICE=""; DEPLOY_HY2=""; DEPLOY_GUARD=""
+GUARD_ACTION=""; TORRENT_ACTION=""; BACKUP_ACTION=""; BACKUP_FILE=""
+domain=""; DEPLOY_AGH=""; DNS_CHOICE=""; DEPLOY_HY2=""; DEPLOY_GUARD=""; DEPLOY_TORRENT=""
 CUSTOM_DOH_URL=""; CUSTOM_DOH_HOST=""; CUSTOM_DOH_IP=""
 
 usage() {
@@ -73,7 +74,8 @@ Usage:
   bash 3x-ui-auto.sh -uninstall y
   bash 3x-ui-auto.sh -adguard y
   bash 3x-ui-auto.sh -adguard-uninstall y
-  bash 3x-ui-auto.sh -stguard {y|status|uninstall}
+  bash 3x-ui-auto.sh -sguard {y|status|uninstall}
+  bash 3x-ui-auto.sh -btguard {y|status|uninstall}
   bash 3x-ui-auto.sh -backup {y|list|restore <file>}
 EOF
 }
@@ -88,7 +90,8 @@ while [ "$#" -gt 0 ]; do
         -uninstall)  require_arg_value "$@"; UNINSTALL="$2";       shift 2 ;;
         -adguard)    require_arg_value "$@"; ADGUARD_ONLY="$2";    shift 2 ;;
         -adguard-uninstall) require_arg_value "$@"; ADGUARD_UNINSTALL="$2"; shift 2 ;;
-        -stguard)    require_arg_value "$@"; GUARD_ACTION="$2"; shift 2 ;;
+        -sguard)     require_arg_value "$@"; GUARD_ACTION="$2"; shift 2 ;;
+        -btguard)    require_arg_value "$@"; TORRENT_ACTION="$2"; shift 2 ;;
         -backup)
             require_arg_value "$@"; BACKUP_ACTION="$2"; shift 2
             if [[ "$BACKUP_ACTION" == restore ]]; then
@@ -107,8 +110,10 @@ for _v in "$INSTALL" "$UNINSTALL" "$ADGUARD_ONLY" "$ADGUARD_UNINSTALL"; do
     [[ "$_v" == y ]] && _action_count=$((_action_count + 1))
 done
 case "$GUARD_ACTION" in ''|y|status|uninstall) ;; *) usage; exit 2 ;; esac
+case "$TORRENT_ACTION" in ''|y|status|uninstall) ;; *) usage; exit 2 ;; esac
 case "$BACKUP_ACTION" in ''|y|list|restore) ;; *) usage; exit 2 ;; esac
 [[ -z "$GUARD_ACTION" ]] || _action_count=$((_action_count + 1))
+[[ -z "$TORRENT_ACTION" ]] || _action_count=$((_action_count + 1))
 [[ -z "$BACKUP_ACTION" ]] || _action_count=$((_action_count + 1))
 (( _action_count == 1 )) || { msg_err "Specify exactly one action."; usage; exit 2; }
 
@@ -409,8 +414,11 @@ choose_hy2() {
 }
 
 choose_guard() {
-    ask_choice DEPLOY_GUARD 'Установить защиту от сканеров и торрентов?' \
-        'Да (подсети сканеров РКН и сигнатуры BitTorrent, списки обновляются сами)' 'Нет'
+    ask_choice DEPLOY_GUARD 'Установить блокировку подсетей сканеров?' 'Да' 'Нет'
+}
+
+choose_torrent() {
+    ask_choice DEPLOY_TORRENT 'Установить серверную блокировку BitTorrent?' 'Да' 'Нет'
 }
 
 # ─── Preserve state for a reversible full uninstall ──────────────────────────
@@ -1260,7 +1268,6 @@ rules:
   - RULE-SET,oisd_big,REJECT
   - OR,((RULE-SET,telegram-ips),(RULE-SET,telegram-domains)),➤ Telegram
   - OR,((RULE-SET,facebook-ips),(RULE-SET,whatsapp-domains)),➤ WhatsApp
-  # xa-torrent-policy
   - RULE-SET,youtube,▶️ YouTube
   - OR,((RULE-SET,discord_domains),(RULE-SET,discord_voiceips),(PROCESS-NAME,Discord.exe)),💬 Discord
   - RULE-SET,ru-bundle,🌍 VPN
@@ -1268,10 +1275,6 @@ rules:
   - RULE-SET,refilter_ipsum,🌍 VPN
   - MATCH,DIRECT
 XA_CLASH_TEMPLATE
-    if [[ "$DEPLOY_GUARD" == 1 ]]; then
-        sed -i '/^  # xa-torrent-policy$/c\  - PROCESS-NAME-REGEX,(?i)^(qbittorrent(-nox)?|transmission(-gtk|-qt|-daemon)?|deluge(d|-gtk)?|utorrent|bittorrent|rtorrent)(\\.exe)?$,REJECT' \
-            /var/www/subpage/clash.yaml.tpl || return 1
-    fi
     python3 - "$domain" "$sub_path" <<'PY_CLASH_TEMPLATE'
 from pathlib import Path
 import sys
@@ -1962,6 +1965,21 @@ run_guard() {
     fi
 }
 
+run_torrent() {
+    if [[ "$1" != -install && -x "$TORRENT_SELF" ]]; then
+        bash "$TORRENT_SELF" "$1"
+    elif [[ "$1" == -status ]]; then
+        if nft list chain inet xa_guard torrent >/dev/null 2>&1; then
+            msg_inf 'Активны сигнатуры BitTorrent из предыдущей версии guard.'
+            return 0
+        fi
+        msg_inf 'Фильтр BitTorrent выключен.'
+        return 1
+    else
+        run_script "${GITHUB_RAW}/torrent.sh" "$1"
+    fi
+}
+
 # Old installs own a legacy firewall snapshot. Use their original cleanup path once.
 remove_panel() {
     if [[ ! -f "$STATE_DIR/firewall/saved" ]]; then
@@ -2252,12 +2270,15 @@ uninstall_xui() {
     cleanup_cover_site || return 1
     systemctl stop x-ui nginx xa-clash-sub xa-apply-qdisc xa-qdisc-sync.path 2>/dev/null || true
     if [[ -f "$dir/guard-installed" && ( -e "$GUARD_SELF" || -d /var/lib/3x-ui-auto/guard ) ]]; then
-        msg_inf "Удаляю защиту от сканеров и торрентов..."
+        msg_inf "Удаляю защиту от сканеров..."
         if [[ -x "$GUARD_SELF" ]]; then
             bash "$GUARD_SELF" -uninstall y || return 1
         else
             run_guard -uninstall || return 1
         fi
+    fi
+    if [[ -f "$dir/torrent-installed" && ( -e "$TORRENT_SELF" || -e /etc/systemd/system/3x-ui-guard-dpi.service ) ]]; then
+        run_torrent -uninstall || return 1
     fi
     if [[ -f "$dir/adguard-installed" ]]; then
         msg_inf "Удаляю AdGuard Home..."
@@ -2339,6 +2360,7 @@ main() {
     choose_xray_dns || return 1
     choose_hy2 || return 1
     choose_guard || return 1
+    choose_torrent || return 1
 
     save_preinstall_state || return 1
     if [[ -n "${reinstall_certs:-}" ]]; then
@@ -2358,6 +2380,10 @@ main() {
         touch "$STATE_DIR/guard-installed" || return 1
         run_guard -install || return 1
     fi
+    if [[ "$DEPLOY_TORRENT" == 1 ]]; then
+        touch "$STATE_DIR/torrent-installed" || return 1
+        run_torrent -install || return 1
+    fi
     show_results || return 1
     rm -f "$INSTALL_IN_PROGRESS_FILE"
 }
@@ -2366,6 +2392,15 @@ if [[ -n "$GUARD_ACTION" ]]; then
     case "$GUARD_ACTION" in y) GUARD_ACTION=install ;; esac
     run_guard "-$GUARD_ACTION"
     exit $?
+fi
+
+if [[ -n "$TORRENT_ACTION" ]]; then
+    case "$TORRENT_ACTION" in y) TORRENT_ACTION=install ;; esac
+    run_torrent "-$TORRENT_ACTION" || exit $?
+    if [[ "$TORRENT_ACTION" == uninstall ]]; then
+        rm -f -- "$STATE_DIR/torrent-installed" || exit 1
+    fi
+    exit 0
 fi
 
 if [[ -n "$BACKUP_ACTION" ]]; then
