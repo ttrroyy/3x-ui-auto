@@ -13,6 +13,7 @@ LIB=/usr/local/lib/3x-ui-auto
 SELF=$LIB/guard.sh
 CONF_DIR=/etc/3x-ui-auto
 SOURCES=$CONF_DIR/guard-sources.list
+ALLOW=$CONF_DIR/guard-allow.cidr
 STATE=/var/lib/3x-ui-auto/guard
 LOG=/var/log/3x-ui-guard.log
 CHAIN=XA_SCAN
@@ -20,29 +21,15 @@ SET4=xa-scan4
 SET6=xa-scan6
 MAXELEM=262144
 LIST_EVERY=21600   # scanner lists: 6 hours
-SIG_EVERY=86400    # torrent signatures: 1 day
 TCHAIN=XA_TORRENT
-# Upstream signature source; only its SIGNATURES/UDP_TRACKER_HEX values are read, never executed.
-SIG_URL=https://raw.githubusercontent.com/VIBEHOST-LLC/vibehost-guard/master/guard.sh
-SIGFILE=$STATE/torrent-signatures
 UNITS=(3x-ui-guard.service 3x-ui-guard-tick.service 3x-ui-guard-tick.timer)
 
-# Built-in BitTorrent protocol markers, used until the first signature download succeeds.
-DEFAULT_SIGNATURES='bt-handshake|BitTorrent protocol
-dht-query|d1:ad2:id20:
-dht-reply|d1:rd2:id20:
-dht-get-peers|9:get_peers
-dht-announce|13:announce_peer
-dht-find-node|9:find_node
-tracker-info-hash|info_hash=
-tracker-peer-id|peer_id=
-tracker-announce|/announce?
-tracker-scrape|/scrape?
-lsd|BT-SEARCH
-magnet|urn:btih:
-udp-tracker|hex:|0000041727101980|'
+# Peer-wire handshake (including its length byte), DHT messages, and UDP tracker connect requests.
+TORRENT_SIGNATURES='tcp|bt-handshake|hex:|13|BitTorrent protocol
+udp|dht-query|d1:ad2:id20:
+udp|dht-reply|d1:rd2:id20:
+udp|udp-tracker|hex:|000004172710198000000000|'
 
-# rkn-guard + lucx-ui scanguard (shadow-netlab, C24Be, CyberOK) and remnanode-antiscan (greatlists).
 DEFAULT_SOURCES=(
     https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/government_networks.list
     https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/antiscanner.list
@@ -71,22 +58,22 @@ url_key() { printf '%s' "$1" | sha1sum | cut -c1-16; }
 # merge_lists WORK STATE OUT KEY...: accept fresh downloads from WORK into STATE (per source,
 # keeping the last good copy on garbage or a >50% shrink), then write the union of STATE to OUT.
 merge_lists() {
-    python3 -I - "$@" <<'PY'
+    python3 -I - "$ALLOW" "$@" <<'PY'
 import ipaddress, sys
 from pathlib import Path
 
-work, state, out = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
-keys = sys.argv[4:]
+allow, work, state, out = map(Path, sys.argv[1:5])
+keys = sys.argv[5:]
 MIN_PREFIX = {4: 16, 6: 32}  # a hijacked list must not cut off whole providers
 
-def parse(path):
+def parse(path, exclusions=False):
     nets = set()
     for raw in path.read_text(encoding='utf-8', errors='replace').splitlines():
         line = raw.split('#', 1)[0].strip()
         if not line:
             continue
         net = ipaddress.ip_network(line, strict=False)  # ValueError rejects HTML/garbage
-        if net.prefixlen >= MIN_PREFIX[net.version] and net.is_global:
+        if exclusions or (net.prefixlen >= MIN_PREFIX[net.version] and net.is_global and not net.is_multicast):
             nets.add(net)
     return nets
 
@@ -103,13 +90,25 @@ for key in keys:
     if not new or (old and len(new) < old / 2):
         print(f'{key}: {old} -> {len(new)} networks, keeping previous copy', file=sys.stderr)
         continue
-    kept.write_text(''.join(f'{n}\n' for n in sorted(new, key=lambda n: (n.version, n))))
+    staged = kept.with_suffix('.new')
+    staged.write_text(''.join(f'{n}\n' for n in sorted(new, key=lambda n: (n.version, n))))
+    staged.replace(kept)
+    (work / '.accepted').touch()
 
 nets = {4: set(), 6: set()}
 for key in keys:
     if (state / key).exists():
         for n in parse(state / key):
             nets[n.version].add(n)
+if not any(nets.values()):
+    raise SystemExit('no usable scanner networks in downloads or cache')
+if allow.exists():
+    for exclusion in parse(allow, exclusions=True):
+        version = exclusion.version
+        nets[version] = {remaining for net in nets[version] for remaining in (
+            net.address_exclude(exclusion) if exclusion.subnet_of(net) else
+            () if net.subnet_of(exclusion) else (net,)
+        )}
 merged = {v: list(ipaddress.collapse_addresses(n)) for v, n in nets.items()}
 out.write_text(''.join(f'{n}\n' for v in (4, 6) for n in merged[v]))
 print(len(merged[4]), len(merged[6]))
@@ -137,7 +136,7 @@ refresh_lists() {
     while IFS= read -r url; do
         key=$(url_key "$url"); keys+=("$key")
         [[ "${1:-}" == download ]] || continue
-        curl -fsSL --proto '=https' --connect-timeout 10 --max-time 60 --max-filesize 16777216 --retry 2 \
+        curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 60 --max-filesize 16777216 --retry 2 \
             "$url" -o "$work/$key" || { rm -f "$work/$key"; echo "download failed, keeping previous copy: $url" >&2; }
     done < <(source_urls)
     if counts=$(merge_lists "$work" "$STATE/src" "$work/merged" "${keys[@]}"); then
@@ -148,8 +147,8 @@ refresh_lists() {
     else
         rc=1
     fi
+    [[ -f "$work/.accepted" && $rc -eq 0 ]] && date +%s >"$STATE/updated"
     rm -rf "$work"
-    [[ "${1:-}" == download && $rc -eq 0 ]] && date +%s >"$STATE/updated"
     return $rc
 }
 
@@ -201,45 +200,14 @@ remove_rules() {
         fi
     done
     for set in "$SET4" "$SET6" "$SET4-new" "$SET6-new"; do
-        ipset destroy "$set" 2>/dev/null
+        if ipset list -n "$set" >/dev/null 2>&1; then
+            ipset destroy "$set" || return 1
+        fi
     done
     return 0
 }
 
 # ─── BitTorrent signatures ───────────────────────────────────────────────────
-# Signature lines: "name|text" for a plain string, "name|hex:|..|" for a hex string.
-current_signatures() {
-    if [[ -s "$SIGFILE" ]]; then cat "$SIGFILE"; else printf '%s\n' "$DEFAULT_SIGNATURES"; fi
-}
-
-# fetch_signatures OUT: read the upstream SIGNATURES and UDP_TRACKER_HEX values as data.
-fetch_signatures() {
-    local src
-    src=$(mktemp) || return 1
-    curl -fsSL --proto '=https' --connect-timeout 15 --max-time 60 --max-filesize 1048576 "$SIG_URL" -o "$src" || { rm -f "$src"; return 1; }
-    python3 -I - "$src" "$1" <<'PY'
-import re, sys
-text = open(sys.argv[1], encoding='utf-8', errors='replace').read()
-block = re.search(r"^SIGNATURES='([^']*)'", text, re.M)
-udp = re.search(r"^UDP_TRACKER_HEX='(\|[0-9a-fA-F]+\|)'", text, re.M)
-if not block or not udp:
-    raise SystemExit('signature block not found')
-out = []
-for line in block.group(1).splitlines():
-    name, sep, pattern = line.partition('|')
-    if not sep or not re.fullmatch(r'[a-z0-9-]{1,40}', name) or not re.fullmatch(r'[\x21-\x7e][\x20-\x7e]{1,80}', pattern) or '"' in pattern:
-        raise SystemExit('unexpected signature line: %r' % line)
-    out.append(name + '|' + pattern)
-if not 5 <= len(out) <= 64:
-    raise SystemExit('unexpected signature count: %d' % len(out))
-out.append('udp-tracker|hex:' + udp.group(1))
-open(sys.argv[2], 'w').write('\n'.join(out) + '\n')
-PY
-    local rc=$?
-    rm -f "$src"
-    return $rc
-}
-
 torrent_hooks() {
     echo INPUT; echo OUTPUT; echo FORWARD
     "$1" -w -n -L DOCKER-USER >/dev/null 2>&1 && echo DOCKER-USER
@@ -247,26 +215,29 @@ torrent_hooks() {
 
 # ensure_torrent_rules [force]: rebuild the chain when its signature set changed, keep one jump per hook.
 ensure_torrent_rules() {
-    local cmd sigs tag name pattern hook n
-    sigs=$(current_signatures)
-    tag="xa-sig:$(printf '%s' "$sigs" | sha1sum | cut -c1-12)"
+    local cmd protocol tag name pattern hook n rules
+    tag="xa-sig-v3:$(printf '%s' "$TORRENT_SIGNATURES" | sha1sum | cut -c1-12)"
+    rules=$( {
+        printf '*filter\n:%s - [0:0]\n' "$TCHAIN"
+        # shortcut: packet inspection only, use stream-aware classification when required.
+        printf -- '-A %s -m connbytes --connbytes 4097: --connbytes-dir both --connbytes-mode bytes -j RETURN\n' "$TCHAIN"
+        while IFS='|' read -r protocol name pattern; do
+            [[ -n "$name" ]] || continue
+            if [[ "$pattern" == hex:* ]]; then
+                printf -- '-A %s -p %s -m string --algo kmp --hex-string "%s" -m comment --comment xa:%s -j DROP\n' \
+                    "$TCHAIN" "$protocol" "${pattern#hex:}" "$name"
+            else
+                printf -- '-A %s -p %s -m string --algo kmp --string "%s" -m comment --comment xa:%s -j DROP\n' \
+                    "$TCHAIN" "$protocol" "$pattern" "$name"
+            fi
+        done <<<"$TORRENT_SIGNATURES"
+        printf -- '-A %s -m comment --comment %s -j RETURN\nCOMMIT\n' "$TCHAIN" "$tag"
+    } ) || return 1
     for cmd in iptables ip6tables; do
         command -v "$cmd" >/dev/null 2>&1 || continue
+        [[ "$cmd" != ip6tables || -d /proc/sys/net/ipv6 ]] || continue
         if [[ "${1:-}" == force ]] || ! "$cmd" -w -S "$TCHAIN" 2>/dev/null | grep -q -- "$tag"; then
-            "$cmd" -w -N "$TCHAIN" 2>/dev/null || "$cmd" -w -F "$TCHAIN" || return 1
-            # Only the first 4 KB of a connection carry the handshakes; later traffic skips the scan.
-            "$cmd" -w -A "$TCHAIN" -m connbytes --connbytes 4097: --connbytes-dir both --connbytes-mode bytes \
-                -m comment --comment "$tag" -j RETURN || return 1
-            while IFS='|' read -r name pattern; do
-                [[ -n "$name" ]] || continue
-                if [[ "$pattern" == hex:* ]]; then
-                    "$cmd" -w -A "$TCHAIN" -p udp -m string --algo bm --hex-string "${pattern#hex:}" \
-                        -m comment --comment "xa:$name" -j DROP || return 1
-                else
-                    "$cmd" -w -A "$TCHAIN" -m string --algo bm --string "$pattern" \
-                        -m comment --comment "xa:$name" -j DROP || return 1
-                fi
-            done <<<"$sigs"
+            "${cmd}-restore" --wait --noflush <<<"$rules" || return 1
         fi
         for hook in $(torrent_hooks "$cmd"); do
             n=$("$cmd" -w -S "$hook" | grep -c -- "-j $TCHAIN\$")
@@ -289,19 +260,6 @@ remove_torrent_rules() {
     done
 }
 
-# Daily: take new signatures only when they parse cleanly; otherwise keep the current set.
-update_signatures() {
-    local new
-    new=$(mktemp) || return 1
-    if fetch_signatures "$new"; then
-        if ! cmp -s "$new" "$SIGFILE"; then
-            install -m 0600 "$new" "$SIGFILE" && echo "torrent signatures updated"
-        fi
-        date +%s >"$STATE/sig-updated"
-    fi
-    rm -f "$new"
-}
-
 # ─── Lifecycle ───────────────────────────────────────────────────────────────
 lock() { exec 8>/run/3x-ui-guard.lock && flock -w 120 8; }
 
@@ -315,17 +273,25 @@ older_than() {
 # Boot: restore sets from cache and hook the chain, no network needed.
 cmd_load() {
     lock || return 1
-    refresh_lists && ensure_rules && ensure_torrent_rules
+    local rc=0
+    refresh_lists && ensure_rules || rc=1
+    ensure_torrent_rules || rc=1
+    return "$rc"
 }
 
-# Every 5 minutes: keep rules in place; refresh lists and signatures when due.
+# Every 5 minutes: keep rules in place and refresh scanner lists when due.
 cmd_tick() {
     lock || return 1
-    if ! ipset list -n "$SET4" >/dev/null 2>&1; then refresh_lists || true; fi
-    if older_than "$STATE/updated" "$LIST_EVERY"; then refresh_lists download || true; fi
-    if older_than "$STATE/sig-updated" "$SIG_EVERY"; then update_signatures || true; fi
-    ensure_rules
-    ensure_torrent_rules
+    local rc=0
+    if older_than "$STATE/updated" "$LIST_EVERY"; then
+        refresh_lists download || rc=1
+    elif ! ipset list -n "$SET4" >/dev/null 2>&1 ||
+        { [[ -d /proc/sys/net/ipv6 ]] && ! ipset list -n "$SET6" >/dev/null 2>&1; }; then
+        refresh_lists || rc=1
+    fi
+    ensure_rules || rc=1
+    ensure_torrent_rules || rc=1
+    return "$rc"
 }
 
 install_units() {
@@ -387,11 +353,17 @@ cmd_install() {
     if ! { apt-get update -q && apt-get install -y -q ca-certificates curl ipset iptables python3 util-linux; } >>"$LOG" 2>&1; then
         msg_err "Не удалось установить зависимости. Журнал: $LOG"; return 1
     fi
+    if [[ -e "$STATE" || -e "$SELF" ]]; then
+        msg_inf 'Удаляю правила, кеш и службы предыдущей установки защиты...'
+        stop_units || return 1
+    fi
+    lock || return 1
+    if [[ -e "$STATE" || -e "$SELF" ]]; then
+        clear_runtime || return 1
+    fi
     install_self || { msg_err "Не удалось установить скрипт защиты в $SELF"; return 1; }
-    [[ -f "$SOURCES" ]] || printf '%s\n' "# Источники подсетей сканеров, по одному URL на строку" "${DEFAULT_SOURCES[@]}" >"$SOURCES"
 
     msg_inf "Загружаю списки подсетей сканеров..."
-    lock || return 1
     if ! refresh_lists download >>"$LOG" 2>&1 || ! ensure_rules >>"$LOG" 2>&1; then
         msg_err "Не удалось применить защиту от сканеров. Журнал: $LOG"; return 1
     fi
@@ -399,41 +371,54 @@ cmd_install() {
     msg_ok "Защита от сканеров включена: IPv4 подсетей ${counts[0]}, IPv6 подсетей ${counts[1]:-0}."
 
     msg_inf "Включаю защиту от торрентов..."
-    if ! update_signatures >>"$LOG" 2>&1 || ! ensure_torrent_rules force >>"$LOG" 2>&1; then
+    if ! ensure_torrent_rules force >>"$LOG" 2>&1; then
         msg_err "Не удалось установить защиту от торрентов. Журнал: $LOG"; return 1
     fi
-    msg_ok "Защита от торрентов включена: $(current_signatures | grep -c '|') сигнатур BitTorrent/DHT и трекеров."
-    exec 8>&-
-
+    msg_ok "Защита от торрентов включена: $(grep -c '|' <<<"$TORRENT_SIGNATURES") сигнатуры BitTorrent, DHT и UDP-трекеров."
     install_units || { msg_err "Не удалось включить автообновление защиты."; return 1; }
-    msg_ok "Списки обновляются автоматически: сканеры каждые 6 часов, сигнатуры торрентов раз в сутки, без перезапусков и разрыва соединений."
+    msg_ok "Внешние списки подсетей проверяются каждые 6 часов. BitTorrent-правила встроены в guard.sh."
+}
+
+stop_units() {
+    local unit
+    for unit in "${UNITS[2]}" "${UNITS[1]}" "${UNITS[0]}"; do
+        if [[ -f "/etc/systemd/system/$unit" ]]; then
+            systemctl stop "$unit" || return 1
+            if systemctl is-enabled --quiet "$unit"; then
+                systemctl disable "$unit" >/dev/null || return 1
+            fi
+        fi
+    done
+}
+
+clear_runtime() {
+    remove_rules || { msg_err "Не удалось удалить правила защиты от сканеров."; return 1; }
+    remove_torrent_rules || { msg_err "Не удалось полностью удалить защиту от торрентов."; return 1; }
+    systemctl reset-failed "${UNITS[@]}" >/dev/null 2>&1 || true
+    rm -f "${UNITS[@]/#//etc/systemd/system/}" && systemctl daemon-reload && rm -rf -- "$STATE"
 }
 
 cmd_uninstall() {
-    local unit
-    lock || return 1
-    for unit in "${UNITS[@]}"; do systemctl disable --now "$unit" >/dev/null 2>&1; done
-    rm -f "${UNITS[@]/#//etc/systemd/system/}"
-    remove_rules || { msg_err "Не удалось удалить правила защиты от сканеров."; return 1; }
-    remove_torrent_rules || { msg_err "Не удалось полностью удалить защиту от торрентов."; return 1; }
-    systemctl daemon-reload
-    systemctl reset-failed >/dev/null 2>&1
-    rm -rf -- "$STATE" "$SOURCES" "$SELF"
+    stop_units && lock && clear_runtime || return 1
+    rm -f -- "$SOURCES" "$ALLOW" "$SELF" "$SELF.new" "$LOG" || return 1
     rmdir "$CONF_DIR" "$LIB" /var/lib/3x-ui-auto 2>/dev/null
     msg_ok "Защита от сканеров и торрентов удалена. Остальные правила firewall не изменены."
 }
 
 cmd_status() {
-    local counts=() when
+    local counts=() when signatures
     [[ -f "$STATE/counts" ]] && read -r -a counts <"$STATE/counts"
     when=$(cat "$STATE/updated" 2>/dev/null)
-    if iptables -w -C INPUT -m conntrack --ctstate NEW -j "$CHAIN" 2>/dev/null; then
+    if iptables -w -C INPUT -m conntrack --ctstate NEW -j "$CHAIN" 2>/dev/null &&
+        iptables -w -C "$CHAIN" -m set --match-set "$SET4" src -j DROP 2>/dev/null; then
         msg_ok "Сканеры: активна, IPv4 ${counts[0]:-0}, IPv6 ${counts[1]:-0}, списки от ${when:+$(date -d "@$when" '+%F %T')}"
     else
         msg_err "Сканеры: не активна"
     fi
-    if iptables -w -C INPUT -j "$TCHAIN" 2>/dev/null; then
-        msg_ok "Торренты: активна ($(iptables -w -S "$TCHAIN" | grep -c 'xa:') сигнатур)"
+    signatures=$(iptables -w -S "$TCHAIN" 2>/dev/null | grep -c 'xa:.*-j DROP$')
+    if [[ "$signatures" -eq $(grep -c '^' <<<"$TORRENT_SIGNATURES") ]] &&
+        iptables -w -C INPUT -j "$TCHAIN" 2>/dev/null; then
+        msg_ok "Торренты: активна ($signatures сигнатур)"
     else
         msg_err "Торренты: не активна"
     fi

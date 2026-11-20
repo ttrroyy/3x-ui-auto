@@ -53,7 +53,8 @@ LIB_DIR="/usr/local/lib/3x-ui-auto"
 COVER_GENERATOR_SHA256="76d4b7b1b9858b626888200b7d546518a5399245e073a153a217b0fec6f674b0"
 COVER_GENERATOR_DIR="${LIB_DIR}/cover-generator"
 STATE_DIR="/var/lib/3x-ui-auto/install"
-COVER_STATE="${STATE_DIR}/cover-generator.json"
+COVER_ROOT=/var/www/3x-ui-auto-cover
+COVER_STATE="${STATE_DIR}/cover-generator-v2.json"
 INSTALL_IN_PROGRESS_FILE="${STATE_DIR}/install-in-progress"
 GUARD_SELF="${LIB_DIR}/guard.sh"
 ADGUARD_INFO=/root/.3x-ui-auto-adguard-info
@@ -477,19 +478,25 @@ restore_renewal_state() {
                 systemctl unmask "$unit" >/dev/null 2>&1 || failed=1
                 case "$enabled" in
                     enabled*) systemctl enable "$unit" >/dev/null 2>&1 || failed=1 ;;
-                    disabled) systemctl disable "$unit" >/dev/null 2>&1 || failed=1 ;;
+                    disabled|not-found|'')
+                        if systemctl is-enabled --quiet "$unit"; then
+                            systemctl disable "$unit" >/dev/null 2>&1 || failed=1
+                        fi ;;
                 esac
                 if [[ "$active" == active ]]; then
                     systemctl start "$unit" >/dev/null 2>&1 || failed=1
-                elif [[ "$active" != unknown && "$enabled" != not-found && -n "$enabled" ]]; then
+                elif systemctl is-active --quiet "$unit"; then
                     systemctl stop "$unit" >/dev/null 2>&1 || failed=1
+                fi
+                if [[ "$active" != failed ]] && systemctl is-failed --quiet "$unit"; then
+                    systemctl reset-failed "$unit" >/dev/null 2>&1 || failed=1
                 fi ;;
         esac
     done
     return "$failed"
 }
 
-OWNED_PATHS=(/etc/nginx /var/www/html /var/www/subpage /etc/sysctl.conf /etc/default/x-ui /etc/fail2ban
+OWNED_PATHS=(/etc/nginx /var/www/subpage /etc/sysctl.conf /etc/default/x-ui /etc/fail2ban
              /etc/modules-load.d/3x-ui-auto-network.conf /etc/sysctl.d/99-bbr-x-ui.conf
              /etc/sysctl.d/99-zz-3x-ui-auto-tuning.conf)
 OWNED_PACKAGES=(nginx-full nginx nginx-common nginx-core fail2ban ufw cron sqlite3 jq)
@@ -774,12 +781,14 @@ install_packages() {
 # ─── SSL certificates ────────────────────────────────────────────────────────
 ensure_panel_cert_links() {
     local d="$1" name link
-    mkdir -p "/root/cert/${d}"
-    chmod 755 /root/cert /root/cert/* 2>/dev/null || true
+    mkdir -p "/root/cert/${d}" || return 1
     for name in fullchain.pem privkey.pem; do
         link="/root/cert/${d}/${name}"
         if [[ -L "$link" && ! -e "$link" ]]; then rm -f -- "$link"; fi
-        [[ -e "$link" || -L "$link" ]] || ln -s "/etc/letsencrypt/live/${d}/${name}" "$link" || return 1
+        if [[ ! -e "$link" && ! -L "$link" ]]; then
+            ln -s "/etc/letsencrypt/live/${d}/${name}" "$link" || return 1
+            printf '%s\n' "$d/$name" >> "$STATE_DIR/panel-cert-links" || return 1
+        fi
     done
 }
 
@@ -794,7 +803,7 @@ get_ssl_certs() {
             --register-unsafely-without-email --cert-name "$d" -d "$d" || {
                 msg_err "$d SSL could not be generated! Check Domain/IP."; return 1;
             }
-        printf '%s\n' "$d" > "${STATE_DIR}/new-certificate"
+        printf '%s\n' "$d" >> "${STATE_DIR}/new-certificate"
     fi
     ensure_panel_cert_links "$d"
 }
@@ -1014,37 +1023,6 @@ EOF
         grpc_pass grpc://127.0.0.1:10080;
     }
 
-    #Xray generic proxy (WS / gRPC by port+path)
-    location ~ ^/(?<fwdport>\d+)/(?<fwdpath>.*)\$ {
-        if (\$hack = 1) { return 404; }
-        client_max_body_size 0;
-        client_body_timeout 1d;
-        grpc_read_timeout 1d;
-        grpc_socket_keepalive on;
-        proxy_read_timeout 1d;
-        proxy_http_version 1.1;
-        proxy_buffering off;
-        proxy_request_buffering off;
-        proxy_socket_keepalive on;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        if (\$content_type ~* "GRPC") {
-            grpc_pass grpc://127.0.0.1:\$fwdport\$is_args\$args;
-            break;
-        }
-        if (\$http_upgrade ~* "(WEBSOCKET|WS)") {
-            proxy_pass http://127.0.0.1:\$fwdport\$is_args\$args;
-            break;
-        }
-        if (\$request_method ~* ^(PUT|POST|GET)\$) {
-            proxy_pass http://127.0.0.1:\$fwdport\$is_args\$args;
-            break;
-        }
-    }
-
     location / { try_files \$uri \$uri/ =404; }
 EOF
 
@@ -1068,7 +1046,7 @@ server {
     listen 127.0.0.1:7443 ssl${http2_listen} proxy_protocol;
     ${http2_on}
     index index.html index.htm index.php;
-    root /var/www/html/;
+    root ${COVER_ROOT};
     real_ip_header proxy_protocol;
     set_real_ip_from 127.0.0.1;
     # Public port is 443: keep redirects relative instead of leaking :7443.
@@ -1317,20 +1295,6 @@ rule-providers:
     format: mrs
     url: https://github.com/legiz-ru/mihomo-rule-sets/raw/main/oisd/big.mrs
     path: ./oisd/big.mrs
-  torrent-trackers:
-    type: http
-    behavior: domain
-    format: mrs
-    url: https://github.com/legiz-ru/mihomo-rule-sets/raw/main/other/torrent-trackers.mrs
-    path: ./rule-sets/torrent-trackers.mrs
-    interval: 86400
-  torrent-clients:
-    type: http
-    behavior: classical
-    format: yaml
-    url: https://github.com/legiz-ru/mihomo-rule-sets/raw/main/other/torrent-clients.yaml
-    path: ./rule-sets/torrent-clients.yaml
-    interval: 86400
   ru-bundle:
     type: http
     behavior: domain
@@ -1343,7 +1307,7 @@ rules:
   - RULE-SET,oisd_big,REJECT
   - OR,((RULE-SET,telegram-ips),(RULE-SET,telegram-domains)),➤ Telegram
   - OR,((RULE-SET,facebook-ips),(RULE-SET,whatsapp-domains)),➤ WhatsApp
-  - OR,((RULE-SET,torrent-clients),(RULE-SET,torrent-trackers)),DIRECT
+  # xa-torrent-policy
   - RULE-SET,youtube,▶️ YouTube
   - OR,((RULE-SET,discord_domains),(RULE-SET,discord_voiceips),(PROCESS-NAME,Discord.exe)),💬 Discord
   - RULE-SET,ru-bundle,🌍 VPN
@@ -1351,6 +1315,10 @@ rules:
   - RULE-SET,refilter_ipsum,🌍 VPN
   - MATCH,DIRECT
 XA_CLASH_TEMPLATE
+    if [[ "$DEPLOY_GUARD" == 1 ]]; then
+        sed -i '/^  # xa-torrent-policy$/c\  - PROCESS-NAME-REGEX,(?i)^(qbittorrent(-nox)?|transmission(-gtk|-qt|-daemon)?|deluge(d|-gtk)?|utorrent|bittorrent|rtorrent)(\\.exe)?$,REJECT' \
+            /var/www/subpage/clash.yaml.tpl || return 1
+    fi
     python3 - "$domain" "$sub_path" <<'PY_CLASH_TEMPLATE'
 from pathlib import Path
 import sys
@@ -1724,23 +1692,32 @@ PY_COVER_PACKAGE
     rm -f "$archive"
 }
 
-cover() { python3 "$COVER_GENERATOR_DIR/generator.py" "$@" --state "$COVER_STATE"; }
+cover() { python3 "$COVER_GENERATOR_DIR/generator.py" "$@" --root "$COVER_ROOT" --state "$COVER_STATE"; }
 
 install_cover_site() {
+    if [[ -e "$COVER_ROOT" && ! -f "$COVER_STATE" ]]; then
+        msg_err "Cover web root already exists: $COVER_ROOT"
+        return 1
+    fi
     install_cover_generator || return 1
     cover generate || return 1
     cover check || return 1
-    chown -R www-data:www-data /var/www/html || return 1
     msg_ok "Local cover site generated and checked."
 }
 
 cleanup_cover_site() {
-    [[ -f "$COVER_STATE" ]] || return 0
+    local legacy_state="${STATE_DIR}/cover-generator.json"
+    [[ -f "$COVER_STATE" || -f "$legacy_state" ]] || return 0
     [[ -f "$COVER_GENERATOR_DIR/generator.py" ]] || {
         msg_err "Cover cleanup helper is missing. Restore generator sources before full removal."
         return 1
     }
-    cover cleanup
+    if [[ -f "$legacy_state" ]]; then
+        python3 "$COVER_GENERATOR_DIR/generator.py" cleanup --root /var/www/html --state "$legacy_state"
+    else
+        cover cleanup || return 1
+        rmdir "$COVER_ROOT" 2>/dev/null || true
+    fi
 }
 
 # ─── Extra geodata: ROSCOM and RUNET next to the stock files ─────────────────
@@ -1838,6 +1815,7 @@ EOF
 # ─── AdGuard Home ────────────────────────────────────────────────────────────
 uninstall_adguard() {
     local quiet="${1:-}" had_adguard=0 dns_state answer
+    [[ -f "$STATE_DIR/adguard-installed" ]] || return 0
     [[ -d /opt/AdGuardHome || -f /etc/nginx/snippets/adguard.conf || -f "$ADGUARD_INFO" ]] && had_adguard=1
     if [[ "$quiet" != quiet && $had_adguard == 1 && -f "$XUIDB" ]]; then
         dns_state=$(python3 - "$XUIDB" "$STATE_DIR/domains" <<'PY_ADGUARD_DNS_DEPENDENCY'
@@ -1866,8 +1844,10 @@ PY_ADGUARD_DNS_DEPENDENCY
     fi
     systemctl stop AdGuardHome 2>/dev/null || true
     [[ -x /opt/AdGuardHome/AdGuardHome ]] && /opt/AdGuardHome/AdGuardHome -s uninstall 2>/dev/null || true
-    rm -rf /opt/AdGuardHome /etc/nginx/snippets/adguard.conf "$ADGUARD_INFO"
-    rm -f "$STATE_DIR/adguard-installed"
+    systemctl disable AdGuardHome 2>/dev/null || true
+    rm -rf /opt/AdGuardHome /etc/nginx/snippets/adguard.conf "$ADGUARD_INFO" || return 1
+    rm -f /etc/systemd/system/AdGuardHome.service || return 1
+    systemctl daemon-reload || return 1
     for f in /etc/nginx/sites-available/*; do
         [[ -f "$f" ]] && sed -i '\|snippets/adguard.conf|d' "$f"
     done
@@ -1876,6 +1856,7 @@ PY_ADGUARD_DNS_DEPENDENCY
         return 1
     fi
     command -v nginx >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
+    rm -f "$STATE_DIR/adguard-installed" || return 1
     [[ "$quiet" != quiet && $had_adguard -eq 1 ]] && msg_ok "AdGuard Home удалён."
     return 0
 }
@@ -1887,6 +1868,11 @@ install_adguard() {
     [[ -n "${domain:-}" ]] || domain=$(head -1 "$STATE_DIR/domains" 2>/dev/null)
     vhost="/etc/nginx/sites-available/${domain}"
     [[ -n "$domain" && -f "$vhost" ]] || { msg_err 'Не найден vhost панели. Сначала установите панель.'; return 1; }
+    if [[ ! -f "$STATE_DIR/adguard-installed" && ( -e "$AGH_DIR" || -e "$AGH_SNIPPET" || -e /etc/systemd/system/AdGuardHome.service ) ]]; then
+        msg_err 'Обнаружена сторонняя установка AdGuard Home.'
+        return 1
+    fi
+    touch "$STATE_DIR/adguard-installed" || return 1
     [[ -n "${IP4:-}" ]] || get_server_ip
     agh_path=""
     [[ -f "$AGH_SNIPPET" ]] && agh_path=$(grep -oP 'location /\Kadg-[a-zA-Z0-9]+' "$AGH_SNIPPET" | head -1 || true)
@@ -1978,7 +1964,6 @@ EOF
         sed -i 's|^\(\s*\)include /etc/nginx/snippets/includes.conf;|\1include /etc/nginx/snippets/adguard.conf;\n\1include /etc/nginx/snippets/includes.conf;|' "$vhost"
     nginx -t >/dev/null 2>&1 || { msg_err "AdGuard Home настроен, но проверка nginx завершилась с ошибкой."; nginx -t; return 1; }
     systemctl reload nginx || { msg_err "nginx не удалось перезагрузить."; return 1; }
-    touch "$STATE_DIR/adguard-installed"
     msg_ok "AdGuard Home установлен."
 }
 
@@ -2276,7 +2261,7 @@ show_results() {
 
 # ─── Uninstall ───────────────────────────────────────────────────────────────
 uninstall_xui() {
-    local dir="$STATE_DIR"
+    local dir="$STATE_DIR" cert_domain name relative link
     [[ -f "$dir/owned-by-3x-ui-auto" && -f "$dir/existing-paths" ]] || {
         msg_err "Ownership snapshot missing. Cannot safely uninstall a foreign installation."
         return 1
@@ -2284,25 +2269,29 @@ uninstall_xui() {
     msg_inf "Начинаю удаление 3x-ui..."
     run_log_policy remove || true
     cleanup_cover_site || return 1
-    systemctl stop x-ui nginx AdGuardHome xa-clash-sub xa-apply-qdisc xa-qdisc-sync.path 2>/dev/null || true
-    if [[ -f "$dir/guard-installed" && -x "$GUARD_SELF" ]]; then
+    systemctl stop x-ui nginx xa-clash-sub xa-apply-qdisc xa-qdisc-sync.path 2>/dev/null || true
+    if [[ -f "$dir/guard-installed" && ( -e "$GUARD_SELF" || -d /var/lib/3x-ui-auto/guard ) ]]; then
         msg_inf "Удаляю защиту от сканеров и торрентов..."
-        bash "$GUARD_SELF" -uninstall y || msg_err "Не удалось полностью удалить защиту."
+        if [[ -x "$GUARD_SELF" ]]; then
+            bash "$GUARD_SELF" -uninstall y || return 1
+        else
+            run_guard -uninstall || return 1
+        fi
     fi
     if [[ -f "$dir/adguard-installed" ]]; then
         msg_inf "Удаляю AdGuard Home..."
-        uninstall_adguard quiet || msg_err "Не удалось полностью удалить AdGuard Home."
+        uninstall_adguard quiet || return 1
     fi
     msg_inf "Отключаю службы и удаляю задание продления сертификата..."
     systemctl disable --now xa-geo-update.timer 2>/dev/null || true
-    systemctl disable x-ui AdGuardHome xa-clash-sub xa-apply-qdisc xa-qdisc-sync.path 2>/dev/null || true
+    systemctl disable x-ui xa-clash-sub xa-apply-qdisc xa-qdisc-sync.path 2>/dev/null || true
     remove_cron_job
     # fail2ban jail and filters installed by the panel's own setup.
     rm -f /etc/fail2ban/jail.d/3x-ipl.conf /etc/fail2ban/filter.d/3x-ipl.conf /etc/fail2ban/action.d/3x-ipl.conf
     msg_inf "Удаляю файлы панели и созданные конфигурации..."
-    rm -rf /etc/x-ui /usr/local/x-ui /var/log/x-ui /opt/AdGuardHome "$ADGUARD_INFO" \
+    rm -rf /etc/x-ui /usr/local/x-ui /var/log/x-ui \
            /etc/systemd/system/x-ui.service.d "$COVER_GENERATOR_DIR"
-    rm -f /usr/bin/x-ui /etc/systemd/system/x-ui.service /etc/systemd/system/AdGuardHome.service \
+    rm -f /usr/bin/x-ui /etc/systemd/system/x-ui.service \
           /etc/systemd/system/xa-clash-sub.service /etc/systemd/system/xa-apply-qdisc.service \
           /etc/systemd/system/xa-qdisc-sync.service /etc/systemd/system/xa-qdisc-sync.path \
           /etc/systemd/system/xa-geo-update.service /etc/systemd/system/xa-geo-update.timer "$GEO_UPDATER" \
@@ -2312,9 +2301,35 @@ uninstall_xui() {
           /etc/nginx/sites-enabled/80.conf /etc/nginx/sites-available/80.conf \
           /etc/nginx/sites-enabled/00-clash-maps.conf /etc/nginx/sites-available/00-clash-maps.conf \
           /etc/nginx/stream-enabled/stream.conf /etc/nginx/snippets/includes.conf \
-          /etc/nginx/snippets/adguard.conf /var/www/subpage/clash.yaml.tpl
+           /var/www/subpage/clash.yaml.tpl
     systemctl daemon-reload 2>/dev/null || true
-    msg_inf "Сертификаты сайтов и данные их продления сохраняются."
+    if [[ "${1:-}" != reinstall && -f "$dir/new-certificate" ]]; then
+        while IFS= read -r cert_domain; do
+            [[ "$cert_domain" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] || return 1
+            if [[ -e "/etc/letsencrypt/renewal/${cert_domain}.conf" ]]; then
+                certbot delete --non-interactive --cert-name "$cert_domain" || return 1
+            fi
+            if [[ ! -f "$dir/panel-cert-links" ]]; then
+                for name in fullchain.pem privkey.pem; do
+                    link="/root/cert/${cert_domain}/${name}"
+                    if [[ "$(readlink "$link")" == "/etc/letsencrypt/live/${cert_domain}/${name}" ]]; then
+                        rm -f -- "$link" || return 1
+                    fi
+                done
+                rmdir "/root/cert/${cert_domain}" /root/cert 2>/dev/null || true
+            fi
+        done < "$dir/new-certificate"
+    fi
+    if [[ -f "$dir/panel-cert-links" ]]; then
+        while IFS= read -r relative; do
+            [[ "$relative" =~ ^[a-z0-9][a-z0-9.-]*/(fullchain|privkey)\.pem$ ]] || return 1
+            link="/root/cert/$relative"
+            if [[ "$(readlink "$link")" == "/etc/letsencrypt/live/$relative" ]]; then
+                rm -f -- "$link" || return 1
+            fi
+            rmdir "${link%/*}" /root/cert 2>/dev/null || true
+        done < "$dir/panel-cert-links"
+    fi
     restore_preinstall_state || return 1
     rm -rf -- "$dir"
     rmdir "$LIB_DIR" /var/lib/3x-ui-auto 2>/dev/null || true
@@ -2341,6 +2356,9 @@ main() {
     choose_guard || return 1
 
     save_preinstall_state || return 1
+    if [[ -n "${reinstall_certs:-}" ]]; then
+        printf '%s\n' "$reinstall_certs" > "$STATE_DIR/new-certificate" || return 1
+    fi
     : > "$INSTALL_IN_PROGRESS_FILE"
     for step in install_packages get_ssl_certs setup_firewall install_panel install_clash_subscription \
                 configure_nginx "run_log_policy install" configure_xui_db apply_xray_template insert_hy2_inbound \
@@ -2352,8 +2370,8 @@ main() {
     restart_xui_wait || return 1
     nginx -t && systemctl reload nginx || return 1
     if [[ "$DEPLOY_GUARD" == 1 ]]; then
+        touch "$STATE_DIR/guard-installed" || return 1
         run_guard -install || return 1
-        touch "$STATE_DIR/guard-installed"
     fi
     show_results || return 1
     rm -f "$INSTALL_IN_PROGRESS_FILE"
@@ -2376,6 +2394,7 @@ if [[ "$ADGUARD_ONLY" == y || "$ADGUARD_UNINSTALL" == y ]]; then
     exit 0
 fi
 
+reinstall_certs=
 if existing_install_detected; then
     [[ -f "$STATE_DIR/owned-by-3x-ui-auto" ]] || {
         msg_err "Found a panel not installed by 3x-ui-auto; refusing to remove it automatically."
@@ -2385,7 +2404,8 @@ if existing_install_detected; then
         msg_inf "Повторная установка отменена. Панель не изменена."
         exit 0
     fi
-    uninstall_xui || exit 1
+    reinstall_certs=$(cat "$STATE_DIR/new-certificate" 2>/dev/null)
+    uninstall_xui reinstall || exit 1
     msg_ok "Previous installation completely removed."
 fi
 

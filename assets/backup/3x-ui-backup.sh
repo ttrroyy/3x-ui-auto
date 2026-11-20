@@ -15,7 +15,7 @@ BACKUP_PATHS=(
     /etc/nginx /etc/x-ui /etc/default/x-ui /etc/fail2ban /etc/cron.d
     /usr/local/x-ui /usr/bin/x-ui /usr/local/lib/3x-ui-auto /usr/local/sbin/xa-apply-qdisc
     /etc/letsencrypt /var/lib/letsencrypt /root/cert
-    /var/www/html /var/www/subpage
+    /var/www/html /var/www/3x-ui-auto-cover /var/www/subpage
     /opt/AdGuardHome /root/.3x-ui-auto-adguard-info
     /var/lib/3x-ui-auto /etc/3x-ui-auto
     /etc/sysctl.conf /etc/sysctl.d/99-bbr-x-ui.conf /etc/sysctl.d/99-zz-3x-ui-auto-tuning.conf
