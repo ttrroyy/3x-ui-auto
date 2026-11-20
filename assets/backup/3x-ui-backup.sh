@@ -230,6 +230,9 @@ cmd_restore() {
         fi
     done
     [[ -d "${staging}/files/etc/systemd/system" ]] && cp -a "${staging}/files/etc/systemd/system/." /etc/systemd/system/
+    if [[ -f /var/lib/3x-ui-auto/install/adguard-installed && -f /etc/systemd/system/AdGuardHome.service ]]; then
+        sed -i 's|^WorkingDirectory=.*|WorkingDirectory=/opt/AdGuardHome|' /etc/systemd/system/AdGuardHome.service
+    fi
     chown -R www-data:www-data /var/www/html /var/www/subpage 2>/dev/null || true
 
     if [[ -f /etc/modules-load.d/3x-ui-auto-network.conf ]]; then
@@ -248,6 +251,10 @@ cmd_restore() {
     elif grep -q '^3x-ui-auto-firewall [01] 1$' "${staging}/services-state"; then
         restore_port_policy
     fi
+    if [[ -f /etc/fail2ban/jail.d/3x-ipl.conf ]]; then
+        install -d -m 0755 /var/log/x-ui
+        touch /var/log/x-ui/{3xipl,3xipl-banned}.log
+    fi
     for path in "${SERVICES[@]}"; do restore_unit_state "$path" "$staging"; done
     if systemctl is-active --quiet 3x-ui-guard-tick.timer; then
         bash /usr/local/lib/3x-ui-auto/guard.sh load
@@ -260,7 +267,7 @@ cmd_restore() {
         systemctl mask --now certbot.timer >/dev/null 2>&1 || true
     fi
 
-    for path in x-ui nginx 3x-ui-auto-firewall 3x-ui-guard-tick.timer; do
+    for path in x-ui nginx xa-clash-sub AdGuardHome fail2ban 3x-ui-auto-firewall 3x-ui-guard-tick.timer 3x-ui-guard-dpi; do
         if [[ "$(awk -v u="$path" '$1==u {print $3; exit}' "${staging}/services-state")" == 1 ]] && ! systemctl is-active --quiet "$path"; then
             die "Restored service is inactive: ${path}"
         fi

@@ -1888,7 +1888,7 @@ EOF
             "$agh_user" "$agh_pass" "$agh_path" "$domain" "$IP4" > "$ADGUARD_INFO")
     fi
     if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${AGH_SERVICE}\.service"; then systemctl restart "$AGH_SERVICE"
-    else "${AGH_DIR}/AdGuardHome" -s install >/dev/null 2>&1; fi
+    else (cd "$AGH_DIR" && ./AdGuardHome -s install) >/dev/null 2>&1 || return 1; fi
     for _ in $(seq 1 20); do curl -fso /dev/null "http://127.0.0.1:${agh_web_port}/" && { agh_up=1; break; }; sleep 0.5; done
     [[ $agh_up -eq 1 ]] || { msg_err "AdGuard Home did not start"; return 1; }
     cat > "$AGH_SNIPPET" <<EOF
