@@ -9,7 +9,8 @@ set -Eeuo pipefail
 umask 077
 
 BACKUP_STORE="/var/backups/x-ui"
-PACKAGES="ca-certificates curl wget jq bash sudo openssl nginx-full certbot python3-certbot-nginx sqlite3 ufw python3 cron iproute2 ipset iptables fail2ban logrotate tar psmisc"
+REPO_RAW=https://raw.githubusercontent.com/ttrroyy/3x-ui-auto/main
+PACKAGES="ca-certificates curl wget jq bash sudo openssl nginx-full certbot python3-certbot-nginx sqlite3 nftables python3 cron iproute2 fail2ban logrotate tar psmisc"
 
 BACKUP_PATHS=(
     /etc/nginx /etc/x-ui /etc/default/x-ui /etc/fail2ban /etc/cron.d
@@ -21,17 +22,16 @@ BACKUP_PATHS=(
     /etc/sysctl.conf /etc/sysctl.d/99-bbr-x-ui.conf /etc/sysctl.d/99-zz-3x-ui-auto-tuning.conf
     /etc/modules-load.d/3x-ui-auto-network.conf
     /etc/logrotate.d/nginx /etc/systemd/journald.conf.d/99-3x-ui-auto-logs.conf
-    /etc/default/ufw /etc/ufw
 )
 
 SYSTEMD_UNITS=(
     x-ui.service xa-clash-sub.service AdGuardHome.service
     xa-apply-qdisc.service xa-qdisc-sync.service xa-qdisc-sync.path
     xa-log-policy.service xa-log-policy.timer xa-geo-update.service xa-geo-update.timer
-    3x-ui-guard.service 3x-ui-guard-tick.service 3x-ui-guard-tick.timer
+    3x-ui-auto-firewall.service 3x-ui-guard.service 3x-ui-guard-tick.service 3x-ui-guard-tick.timer
 )
 # Services whose enabled/active state is recorded and replayed, in start order.
-SERVICES=(x-ui nginx xa-clash-sub AdGuardHome fail2ban xa-apply-qdisc xa-qdisc-sync.path xa-log-policy.timer xa-geo-update.timer
+SERVICES=(3x-ui-auto-firewall x-ui nginx xa-clash-sub AdGuardHome fail2ban xa-apply-qdisc xa-qdisc-sync.path xa-log-policy.timer xa-geo-update.timer
           3x-ui-guard 3x-ui-guard-tick.timer)
 
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
@@ -79,7 +79,6 @@ cmd_backup() {
         [[ "$svc" == x-ui ]] && active="$BACKUP_WAS_ACTIVE"
         printf '%s %s %s\n' "$svc" "$enabled" "$active" >> "${staging}/services-state"
     done
-    if ufw status 2>/dev/null | grep -q '^Status: active'; then echo active; else echo inactive; fi > "${staging}/ufw-state"
 
     blue "==> Collecting files..."
     for path in "${BACKUP_PATHS[@]}"; do
@@ -141,9 +140,26 @@ restore_unit_state() {
     if [[ "$saved_active" == 1 ]]; then systemctl start "$unit" 2>/dev/null || true; else systemctl stop "$unit" 2>/dev/null || true; fi
 }
 
+restore_port_policy() {
+    local helper=/usr/local/lib/3x-ui-auto/firewall.sh db=/etc/x-ui/x-ui.db udp
+    udp=$(sqlite3 "$db" "SELECT DISTINCT port FROM inbounds WHERE enable AND protocol = 'hysteria' ORDER BY port;" | paste -sd, -)
+    bash "$helper" install "$udp"
+}
+
+migrate_legacy_backup() {
+    local staging=$1 helper=/usr/local/lib/3x-ui-auto/firewall.sh panel
+    install -m 0755 "$staging/firewall.sh" "$helper"
+    restore_port_policy
+    panel=$(sqlite3 /etc/x-ui/x-ui.db "SELECT value FROM settings WHERE key = 'webPort' LIMIT 1;")
+    bash "$helper" iplimit "$panel"
+    if [[ -f "$staging/guard.sh" ]]; then
+        bash "$staging/guard.sh" -install y
+    fi
+}
+
 cmd_restore() {
     require_root
-    local backup_file="${1:-}" unpacked_bytes unpacked_kb have_kb staging path src cert_path module
+    local backup_file="${1:-}" unpacked_bytes unpacked_kb have_kb staging path src cert_path module legacy=0
     [[ -n "$backup_file" ]] || die "Usage: $0 restore <backup.tar.gz>"
     [[ -f "$backup_file" ]] || die "File not found: ${backup_file}"
     command -v python3 >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -q python3; }
@@ -161,14 +177,30 @@ cmd_restore() {
     tar -xzf "$backup_file" -C "$staging"
     cat "${staging}/meta.json"
     echo
+    [[ ! -f /var/lib/3x-ui-auto/install/firewall/saved ]] || die 'Сначала удалите прежнюю установку через -uninstall y.'
 
     blue "==> Installing packages..."
     apt-get update -qq
     # shellcheck disable=SC2086
     apt-get install -y $PACKAGES
+    if [[ -f "$staging/ufw-state" ]]; then
+        legacy=1
+        curl -fsSL --proto '=https' --proto-redir '=https' "$REPO_RAW/assets/firewall.sh" -o "$staging/firewall.sh"
+        bash -n "$staging/firewall.sh"
+        if [[ -f "$staging/files/usr/local/lib/3x-ui-auto/guard.sh" ]]; then
+            curl -fsSL --proto '=https' --proto-redir '=https' "$REPO_RAW/guard.sh" -o "$staging/guard.sh"
+            bash -n "$staging/guard.sh"
+        fi
+        rm -f -- "$staging/files/var/lib/3x-ui-auto/install/firewall/saved"
+    fi
 
     blue "==> Stopping services..."
     for path in "${SERVICES[@]}"; do systemctl stop "$path" 2>/dev/null || true; done
+    if grep -qs '^SET4=xa-scan4$' /usr/local/lib/3x-ui-auto/guard.sh; then
+        bash /usr/local/lib/3x-ui-auto/guard.sh -uninstall y
+    elif nft list table inet xa_guard >/dev/null 2>&1; then
+        nft delete table inet xa_guard
+    fi
 
     blue "==> Restoring files..."
     # Certificates: never replace a newer local certificate with an older archived one.
@@ -204,19 +236,24 @@ cmd_restore() {
     blue "==> Enabling and starting services..."
     systemctl daemon-reload
     nginx -t || die "nginx config test failed after restore"
+    if (( legacy )); then
+        migrate_legacy_backup "$staging"
+    elif grep -q '^3x-ui-auto-firewall [01] 1$' "${staging}/services-state"; then
+        restore_port_policy
+    fi
     for path in "${SERVICES[@]}"; do restore_unit_state "$path" "$staging"; done
+    if systemctl is-active --quiet 3x-ui-guard-tick.timer; then
+        bash /usr/local/lib/3x-ui-auto/guard.sh load
+    fi
 
-    blue "==> Restoring firewall and cron..."
-    if [[ "$(cat "${staging}/ufw-state" 2>/dev/null)" == active ]]; then ufw --force enable >/dev/null; else ufw --force disable >/dev/null; fi
-    # ufw rebuilds INPUT: put the guard chains back on top.
-    [[ -x /usr/local/lib/3x-ui-auto/guard.sh ]] && /usr/local/lib/3x-ui-auto/guard.sh load || true
+    blue "==> Restoring cron..."
     [[ -s "${staging}/root-crontab" ]] && crontab "${staging}/root-crontab"
     if crontab -l 2>/dev/null | grep -q 'certbot renew'; then
         systemctl enable --now cron >/dev/null 2>&1 || true
         systemctl mask --now certbot.timer >/dev/null 2>&1 || true
     fi
 
-    for path in x-ui nginx; do
+    for path in x-ui nginx 3x-ui-auto-firewall 3x-ui-guard-tick.timer; do
         if [[ "$(awk -v u="$path" '$1==u {print $3; exit}' "${staging}/services-state")" == 1 ]] && ! systemctl is-active --quiet "$path"; then
             die "Restored service is inactive: ${path}"
         fi
@@ -252,7 +289,7 @@ Usage: $(basename "$0") {backup|restore <file>|list}
   list              list available backups
 
 Backed up: panel DB and binaries, nginx, certificates, cover site, Clash/Mihomo renderer,
-AdGuard Home, scanner/torrent guard, BBR/qdisc settings, fail2ban, UFW, systemd units, cron.
+AdGuard Home, scanner/torrent guard, BBR/qdisc settings, Fail2ban, nftables, systemd units and cron.
 EOF
         exit 1
         ;;

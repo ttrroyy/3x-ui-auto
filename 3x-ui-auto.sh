@@ -49,6 +49,7 @@ check_cpu
 XUIDB="/etc/x-ui/x-ui.db"
 GITHUB_RAW="https://raw.githubusercontent.com/ttrroyy/3x-ui-auto/main"
 PANEL_REPO="MHSanaei/3x-ui"
+LEGACY_INSTALLER="https://raw.githubusercontent.com/ttrroyy/3x-ui-auto/49e87ce857bf164b3764ea5dd0b5c43486fb744a/3x-ui-auto.sh"
 LIB_DIR="/usr/local/lib/3x-ui-auto"
 COVER_GENERATOR_SHA256="76d4b7b1b9858b626888200b7d546518a5399245e073a153a217b0fec6f674b0"
 COVER_GENERATOR_DIR="${LIB_DIR}/cover-generator"
@@ -61,6 +62,7 @@ ADGUARD_INFO=/root/.3x-ui-auto-adguard-info
 
 # ─── Arguments ───────────────────────────────────────────────────────────────
 INSTALL=""; UNINSTALL=""; ADGUARD_ONLY=""; ADGUARD_UNINSTALL=""; PANEL_VERSION=""
+GUARD_ACTION=""; BACKUP_ACTION=""; BACKUP_FILE=""
 domain=""; DEPLOY_AGH=""; DNS_CHOICE=""; DEPLOY_HY2=""; DEPLOY_GUARD=""
 CUSTOM_DOH_URL=""; CUSTOM_DOH_HOST=""; CUSTOM_DOH_IP=""
 
@@ -71,6 +73,8 @@ Usage:
   bash 3x-ui-auto.sh -uninstall y
   bash 3x-ui-auto.sh -adguard y
   bash 3x-ui-auto.sh -adguard-uninstall y
+  bash 3x-ui-auto.sh -stguard {y|status|uninstall}
+  bash 3x-ui-auto.sh -backup {y|list|restore <file>}
 EOF
 }
 
@@ -84,6 +88,13 @@ while [ "$#" -gt 0 ]; do
         -uninstall)  require_arg_value "$@"; UNINSTALL="$2";       shift 2 ;;
         -adguard)    require_arg_value "$@"; ADGUARD_ONLY="$2";    shift 2 ;;
         -adguard-uninstall) require_arg_value "$@"; ADGUARD_UNINSTALL="$2"; shift 2 ;;
+        -stguard)    require_arg_value "$@"; GUARD_ACTION="$2"; shift 2 ;;
+        -backup)
+            require_arg_value "$@"; BACKUP_ACTION="$2"; shift 2
+            if [[ "$BACKUP_ACTION" == restore ]]; then
+                [[ $# -gt 0 && "$1" != -* ]] || { usage; exit 2; }
+                BACKUP_FILE="$1"; shift
+            fi ;;
         -version)    require_arg_value "$@"; PANEL_VERSION="$2";   shift 2 ;;
         -h|--help)   usage; exit 0 ;;
         *)           msg_err "Unknown option: $1"; usage; exit 2 ;;
@@ -95,6 +106,10 @@ for _v in "$INSTALL" "$UNINSTALL" "$ADGUARD_ONLY" "$ADGUARD_UNINSTALL"; do
     [[ -z "$_v" || "$_v" == y ]] || { msg_err "Action options accept only the value: y"; usage; exit 2; }
     [[ "$_v" == y ]] && _action_count=$((_action_count + 1))
 done
+case "$GUARD_ACTION" in ''|y|status|uninstall) ;; *) usage; exit 2 ;; esac
+case "$BACKUP_ACTION" in ''|y|list|restore) ;; *) usage; exit 2 ;; esac
+[[ -z "$GUARD_ACTION" ]] || _action_count=$((_action_count + 1))
+[[ -z "$BACKUP_ACTION" ]] || _action_count=$((_action_count + 1))
 (( _action_count == 1 )) || { msg_err "Specify exactly one action."; usage; exit 2; }
 
 # ─── Generators ──────────────────────────────────────────────────────────────
@@ -399,52 +414,6 @@ choose_guard() {
 }
 
 # ─── Preserve state for a reversible full uninstall ──────────────────────────
-save_firewall_state() {
-    local state_dir="${STATE_DIR}/firewall"
-    [[ -f "${state_dir}/saved" ]] && return 0
-    mkdir -p "$state_dir"
-    {
-        if command -v ufw >/dev/null 2>&1; then
-            echo 'UFW_WAS_INSTALLED=1'
-            if ufw status 2>/dev/null | grep -q '^Status: active'; then echo 'UFW_WAS_ACTIVE=1'; else echo 'UFW_WAS_ACTIVE=0'; fi
-        else
-            echo 'UFW_WAS_INSTALLED=0'
-            echo 'UFW_WAS_ACTIVE=0'
-        fi
-    } > "${state_dir}/state"
-    tar -cpf "${state_dir}/ufw-config.tar" /etc/ufw /etc/default/ufw 2>/dev/null || true
-    command -v iptables-save >/dev/null 2>&1 && iptables-save > "${state_dir}/iptables.v4" 2>/dev/null || true
-    command -v ip6tables-save >/dev/null 2>&1 && ip6tables-save > "${state_dir}/iptables.v6" 2>/dev/null || true
-    touch "${state_dir}/saved"
-}
-
-# The guard owns its rules and reloads them itself, so snapshots never carry them back.
-strip_guard_rules() {
-    sed -e '/^:\(XA_SCAN\|XA_TORRENT\) /d' -e '/^-A \(XA_SCAN\|XA_TORRENT\) /d' -e '/ -[jg] \(XA_SCAN\|XA_TORRENT\)$/d' "$1"
-}
-
-restore_firewall_state() {
-    local state_dir="${STATE_DIR}/firewall"
-    local UFW_WAS_INSTALLED=0 UFW_WAS_ACTIVE=0
-    [[ -f "${state_dir}/saved" && -f "${state_dir}/state" ]] || return 0
-    # shellcheck disable=SC1090
-    source "${state_dir}/state"
-    if command -v ufw >/dev/null 2>&1; then
-        ufw --force disable >/dev/null 2>&1 || true
-        ufw --force reset >/dev/null 2>&1 || true
-    fi
-    if [[ "$UFW_WAS_INSTALLED" == 1 ]]; then
-        [[ -f "${state_dir}/ufw-config.tar" ]] && tar -xpf "${state_dir}/ufw-config.tar" -C / 2>/dev/null || true
-        [[ "$UFW_WAS_ACTIVE" == 1 ]] && ufw --force enable >/dev/null 2>&1 || true
-    fi
-    [[ -s "${state_dir}/iptables.v4" ]] && command -v iptables-restore >/dev/null 2>&1 &&
-        strip_guard_rules "${state_dir}/iptables.v4" | iptables-restore 2>/dev/null || true
-    [[ -s "${state_dir}/iptables.v6" ]] && command -v ip6tables-restore >/dev/null 2>&1 &&
-        strip_guard_rules "${state_dir}/iptables.v6" | ip6tables-restore 2>/dev/null || true
-    [[ -x "$GUARD_SELF" ]] && "$GUARD_SELF" load >/dev/null 2>&1 || true
-    msg_ok "Firewall restored to its pre-install state."
-}
-
 save_renewal_state() {
     local dir="$1" unit
     mkdir -p "$dir" || return 1
@@ -499,7 +468,7 @@ restore_renewal_state() {
 OWNED_PATHS=(/etc/nginx /var/www/subpage /etc/sysctl.conf /etc/default/x-ui /etc/fail2ban
              /etc/modules-load.d/3x-ui-auto-network.conf /etc/sysctl.d/99-bbr-x-ui.conf
              /etc/sysctl.d/99-zz-3x-ui-auto-tuning.conf)
-OWNED_PACKAGES=(nginx-full nginx nginx-common nginx-core fail2ban ufw cron sqlite3 jq)
+OWNED_PACKAGES=(nginx-full nginx nginx-common nginx-core fail2ban cron sqlite3 jq)
 
 save_preinstall_state() {
     local dir="${STATE_DIR}" path
@@ -522,7 +491,6 @@ save_preinstall_state() {
     save_renewal_state "$dir/renewal-baseline" || return 1
     sysctl -n net.core.default_qdisc > "$dir/qdisc" 2>/dev/null || true
     sysctl -n net.ipv4.tcp_congestion_control > "$dir/congestion-control" 2>/dev/null || true
-    save_firewall_state || return 1
     printf '%s\n' "$domain" > "$dir/domains"
     touch "$dir/owned-by-3x-ui-auto"
     umask 022
@@ -542,7 +510,6 @@ restore_preinstall_state() {
         }
     sysctl -w "net.core.default_qdisc=$(cat "$dir/qdisc")" >/dev/null 2>&1 || true
     sysctl -w "net.ipv4.tcp_congestion_control=$(cat "$dir/congestion-control")" >/dev/null 2>&1 || true
-    restore_firewall_state
     restore_renewal_state "$dir/renewal-baseline" || return 1
     if [[ -f "$dir/nginx-enabled" ]]; then systemctl enable nginx >/dev/null 2>&1 || true
     else systemctl disable nginx >/dev/null 2>&1 || true; fi
@@ -757,9 +724,8 @@ PY_XA_LOG_POLICY
 # ─── Packages ────────────────────────────────────────────────────────────────
 install_packages() {
     local nginx_repair=0
-    ufw disable 2>/dev/null || true
     apt-get -y update || return 1
-    apt-get -y install curl wget jq bash sudo openssl nginx-full certbot python3-certbot-nginx sqlite3 ufw \
+    apt-get -y install curl wget jq bash sudo openssl nginx-full certbot python3-certbot-nginx sqlite3 nftables fail2ban \
         python3 cron iproute2 logrotate tar ca-certificates psmisc || return 1
     # A previous interrupted install can leave nginx installed without its config.
     [[ -f /etc/nginx/nginx.conf ]] || nginx_repair=1
@@ -809,25 +775,12 @@ get_ssl_certs() {
 }
 
 # ─── Firewall ────────────────────────────────────────────────────────────────
-ssh_ports() {
-    local ports
-    ports=$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | sort -un)
-    echo "${ports:-22}"
-}
-
 setup_firewall() {
-    local port
-    ufw --force disable >/dev/null
-    ufw default deny incoming
-    ufw default allow outgoing
-    ufw default allow routed
-    for port in $(ssh_ports); do ufw allow "${port}/tcp"; done
-    ufw allow 80/tcp
-    ufw allow 443/tcp
-    [[ "$DEPLOY_HY2" == 1 && -n "$hy2_port" ]] && ufw allow "${hy2_port}/udp"
-    ufw --force enable
-    # ufw rebuilds INPUT: put the guard chains back on top right away.
-    [[ -x "$GUARD_SELF" ]] && "$GUARD_SELF" load >/dev/null 2>&1 || true
+    install -d -m 0755 "$LIB_DIR" || return 1
+    local firewall="$LIB_DIR/firewall.sh"
+    fetch_script "${GITHUB_RAW}/assets/firewall.sh" "$firewall.new" || return 1
+    mv -f "$firewall.new" "$firewall" || return 1
+    bash "$firewall" install "$hy2_port"
 }
 
 # ─── Panel (official 3x-ui installer, non-interactive) ───────────────────────
@@ -856,7 +809,7 @@ install_panel() {
     fi
     msg_inf "Устанавливаю 3x-ui ${PANEL_TAG} штатным установщиком..."
     XUI_NONINTERACTIVE=1 XUI_SSL_MODE=none XUI_USERNAME="$config_username" XUI_PASSWORD="$config_password" \
-        XUI_PANEL_PORT="$panel_port" XUI_WEB_BASE_PATH="$panel_path" XUI_ENABLE_FAIL2BAN=true \
+        XUI_PANEL_PORT="$panel_port" XUI_WEB_BASE_PATH="$panel_path" XUI_ENABLE_FAIL2BAN=false \
         bash "$installer" "$PANEL_TAG" </dev/null 2>&1 | tee "$log"
     if (( PIPESTATUS[0] != 0 )); then
         rm -f "$installer"
@@ -868,7 +821,7 @@ install_panel() {
     rm -f /etc/x-ui/install-result.env
     systemctl stop x-ui 2>/dev/null || true
     [[ -f "$XUIDB" ]] || { msg_err "x-ui.db not found after installation."; return 1; }
-    grep -q 'fail2ban' "$log" && msg_inf "Fail2ban для IP Limit настроен штатным установщиком."
+    bash "$LIB_DIR/firewall.sh" iplimit "$panel_port" && systemctl enable fail2ban && systemctl restart fail2ban || return 1
     msg_ok "3x-ui ${PANEL_TAG} installed."
 }
 
@@ -1986,16 +1939,44 @@ print_adguard_results() {
 }
 
 # ─── Scanner and torrent guard (separate script) ─────────────────────────────
+fetch_script() {
+    curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 120 "$1" -o "$2" && bash -n "$2"
+}
+
+run_script() (
+    local url=$1 script
+    shift
+    script=$(mktemp) || exit 1
+    trap 'rm -f -- "$script"' EXIT
+    fetch_script "$url" "$script" || { msg_err "Не удалось скачать: $url"; exit 1; }
+    bash "$script" "$@"
+)
+
 run_guard() {
-    local script rc
-    script=$(mktemp) || return 1
-    if ! curl -fsSL --connect-timeout 15 --max-time 120 "${GITHUB_RAW}/guard.sh" -o "$script" || ! bash -n "$script"; then
-        rm -f "$script"; msg_err "Не удалось скачать скрипт защиты."; return 1
+    if [[ "$1" != -install && -x "$GUARD_SELF" ]]; then
+        bash "$GUARD_SELF" "$1" y
+    elif [[ "$1" != -install && ! -d /var/lib/3x-ui-auto/guard ]]; then
+        msg_inf 'Защита не установлена.'
+    else
+        run_script "${GITHUB_RAW}/guard.sh" "$1" y
     fi
-    bash "$script" "$1" y
-    rc=$?
-    rm -f "$script"
-    return $rc
+}
+
+# Old installs own a legacy firewall snapshot. Use their original cleanup path once.
+remove_panel() {
+    if [[ ! -f "$STATE_DIR/firewall/saved" ]]; then
+        uninstall_xui "$@"
+        return $?
+    fi
+    if [[ "${1:-}" == reinstall && -f "$STATE_DIR/new-certificate" ]]; then
+        mv "$STATE_DIR/new-certificate" "$STATE_DIR/reinstall-certificate" || return 1
+        if ! run_script "$LEGACY_INSTALLER" -uninstall y; then
+            mv "$STATE_DIR/reinstall-certificate" "$STATE_DIR/new-certificate"
+            return 1
+        fi
+        return 0
+    fi
+    run_script "$LEGACY_INSTALLER" -uninstall y
 }
 
 # ─── BBR / FQ and kernel tuning ──────────────────────────────────────────────
@@ -2286,7 +2267,11 @@ uninstall_xui() {
     systemctl disable --now xa-geo-update.timer 2>/dev/null || true
     systemctl disable x-ui xa-clash-sub xa-apply-qdisc xa-qdisc-sync.path 2>/dev/null || true
     remove_cron_job
-    # fail2ban jail and filters installed by the panel's own setup.
+    if [[ -f "$LIB_DIR/firewall.sh" ]]; then
+        bash "$LIB_DIR/firewall.sh" remove || return 1
+    fi
+    if systemctl is-active --quiet fail2ban; then fail2ban-client stop 3x-ipl >/dev/null 2>&1 || true; fi
+    # Remove the panel's Fail2ban jail.
     rm -f /etc/fail2ban/jail.d/3x-ipl.conf /etc/fail2ban/filter.d/3x-ipl.conf /etc/fail2ban/action.d/3x-ipl.conf
     msg_inf "Удаляю файлы панели и созданные конфигурации..."
     rm -rf /etc/x-ui /usr/local/x-ui /var/log/x-ui \
@@ -2296,7 +2281,7 @@ uninstall_xui() {
           /etc/systemd/system/xa-qdisc-sync.service /etc/systemd/system/xa-qdisc-sync.path \
           /etc/systemd/system/xa-geo-update.service /etc/systemd/system/xa-geo-update.timer "$GEO_UPDATER" \
           /usr/local/sbin/xa-apply-qdisc "${LIB_DIR}/clash-sub-server.py" "${LIB_DIR}/log-policy.py" \
-          /etc/x-ui/.xa-bbr-restore /var/log/3x-ui-auto-panel-install.log
+          /etc/x-ui/.xa-bbr-restore /var/log/3x-ui-auto-panel-install.log "${LIB_DIR}/firewall.sh" "${LIB_DIR}/firewall.sh.new"
     rm -f "/etc/nginx/sites-enabled/$(cat "$dir/domains")" "/etc/nginx/sites-available/$(cat "$dir/domains")" \
           /etc/nginx/sites-enabled/80.conf /etc/nginx/sites-available/80.conf \
           /etc/nginx/sites-enabled/00-clash-maps.conf /etc/nginx/sites-available/00-clash-maps.conf \
@@ -2377,8 +2362,20 @@ main() {
     rm -f "$INSTALL_IN_PROGRESS_FILE"
 }
 
+if [[ -n "$GUARD_ACTION" ]]; then
+    case "$GUARD_ACTION" in y) GUARD_ACTION=install ;; esac
+    run_guard "-$GUARD_ACTION"
+    exit $?
+fi
+
+if [[ -n "$BACKUP_ACTION" ]]; then
+    case "$BACKUP_ACTION" in y) BACKUP_ACTION=backup ;; esac
+    run_script "${GITHUB_RAW}/assets/backup/3x-ui-backup.sh" "$BACKUP_ACTION" ${BACKUP_FILE:+"$BACKUP_FILE"}
+    exit $?
+fi
+
 if [[ "$UNINSTALL" == y ]]; then
-    uninstall_xui || exit 1
+    remove_panel || exit 1
     exit 0
 fi
 
@@ -2405,7 +2402,7 @@ if existing_install_detected; then
         exit 0
     fi
     reinstall_certs=$(cat "$STATE_DIR/new-certificate" 2>/dev/null)
-    uninstall_xui reinstall || exit 1
+    remove_panel reinstall || exit 1
     msg_ok "Previous installation completely removed."
 fi
 
