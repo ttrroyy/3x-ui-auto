@@ -10,7 +10,7 @@ umask 077
 
 BACKUP_STORE="/var/backups/x-ui"
 REPO_RAW=https://raw.githubusercontent.com/ttrroyy/3x-ui-auto/main
-PACKAGES="ca-certificates curl wget jq bash sudo openssl nginx-full certbot python3-certbot-nginx sqlite3 nftables libmnl0 python3 cron iproute2 fail2ban logrotate tar psmisc"
+PACKAGES="ca-certificates curl wget jq bash sudo openssl nginx-full certbot python3-certbot-nginx sqlite3 nftables libmnl0 python3 python3-systemd cron iproute2 fail2ban logrotate tar psmisc"
 
 BACKUP_PATHS=(
     /etc/nginx /etc/x-ui /etc/default/x-ui /etc/fail2ban /etc/cron.d

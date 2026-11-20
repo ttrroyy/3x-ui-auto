@@ -734,7 +734,7 @@ install_packages() {
     local nginx_repair=0
     apt-get -y update || return 1
     apt-get -y install curl wget jq bash sudo openssl nginx-full certbot python3-certbot-nginx sqlite3 nftables fail2ban \
-        python3 cron iproute2 logrotate tar ca-certificates psmisc || return 1
+        python3 python3-systemd cron iproute2 logrotate tar ca-certificates psmisc || return 1
     # A previous interrupted install can leave nginx installed without its config.
     [[ -f /etc/nginx/nginx.conf ]] || nginx_repair=1
     [[ -d /etc/nginx/sites-available && -d /etc/nginx/sites-enabled ]] || nginx_repair=1

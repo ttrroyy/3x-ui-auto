@@ -76,7 +76,8 @@ remove_firewall() {
 }
 
 configure_iplimit() {
-    local panel=${1:-} ssh exempt
+    local panel=${1:-} ssh exempt check
+    local sshd_override=/etc/fail2ban/jail.d/99-3x-ui-auto-sshd-journal.local
     ssh=$(ssh_ports | paste -sd, -)
     exempt=${ssh:-22}${panel:+,$panel}
     [[ "$exempt" =~ ^[0-9]+(,[0-9]+)*$ ]]
@@ -116,7 +117,19 @@ chain = input
 blocktype = drop
 EOF
     printf 'exemptports = %s\n' "$exempt" >>/etc/fail2ban/action.d/3x-ipl.conf
-    fail2ban-client -t
+    if check=$(LC_ALL=C fail2ban-client -t 2>&1); then
+        printf '%s\n' "$check"
+        return 0
+    fi
+    if [[ "$check" != *'Have not found any log file for sshd jail'* || -e "$sshd_override" || -L "$sshd_override" ]]; then
+        printf '%s\n' "$check" >&2
+        return 1
+    fi
+    printf '[sshd]\nbackend = systemd\n' >"$sshd_override"
+    if ! fail2ban-client -t; then
+        rm -f -- "$sshd_override"
+        return 1
+    fi
 }
 
 case ${1:-} in
