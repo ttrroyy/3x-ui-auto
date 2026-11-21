@@ -83,27 +83,30 @@ EOF
 
 build_dpi() {
     local tmp=$1
-    curl -fsSL --retry 2 --connect-timeout 15 --max-time 120 --proto '=https' --proto-redir '=https' \
+    echo "Скачиваю исходники детектора..."
+    curl -fL --progress-bar --retry 2 --connect-timeout 15 --max-time 120 --proto '=https' --proto-redir '=https' \
         https://codeload.github.com/ttrroyy/3x-ui-auto/tar.gz/refs/heads/main -o "$tmp/repo.tgz" &&
         tar -xzf "$tmp/repo.tgz" -C "$tmp" --strip-components=2 3x-ui-auto-main/assets/vh-dpid &&
         bash "$tmp/vh-dpid/build.sh" "$tmp/vh-dpid.bin"
 }
 
 cmd_install() (
+    set -o pipefail
     local tmp attempt
-    echo "Устанавливаю зависимости и собираю детектор BitTorrent..."
+    echo "Устанавливаю зависимости детектора BitTorrent. Журнал $LOG"
     if ! { apt-get update -q && apt-get install -y -q --no-install-recommends ca-certificates curl nftables util-linux \
-        build-essential autoconf automake libtool pkg-config libmnl-dev libpcap-dev; } >>"$LOG" 2>&1; then
+        build-essential autoconf automake libtool pkg-config libmnl-dev libpcap-dev; } 2>&1 | tee -a "$LOG"; then
         echo "Не удалось установить зависимости. Журнал $LOG" >&2
         return 1
     fi
     tmp=$(mktemp -d) || return 1
     trap 'rm -rf -- "$tmp"' EXIT
     exec 8>/run/3x-ui-torrent.lock && flock -w 600 8 || return 1
-    if ! build_dpi "$tmp" >>"$LOG" 2>&1; then
+    if ! build_dpi "$tmp" 2>&1 | tee -a "$LOG"; then
         echo "Не удалось собрать детектор. Журнал $LOG" >&2
         return 1
     fi
+    echo "Сборка завершена. Устанавливаю и запускаю детектор..."
     split_old_guard || return 1
     if [[ -f "/etc/systemd/system/$UNIT" ]]; then systemctl stop "$UNIT" || return 1; fi
     install -d -m 0755 "$LIB" || return 1
