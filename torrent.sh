@@ -84,7 +84,7 @@ EOF
 build_dpi() {
     local tmp=$1
     echo "Скачиваю исходники детектора..."
-    curl -fL --progress-bar --retry 2 --connect-timeout 15 --max-time 120 --proto '=https' --proto-redir '=https' \
+    curl -fsSL --retry 2 --connect-timeout 15 --max-time 120 --proto '=https' --proto-redir '=https' \
         https://codeload.github.com/ttrroyy/3x-ui-auto/tar.gz/refs/heads/main -o "$tmp/repo.tgz" &&
         tar -xzf "$tmp/repo.tgz" -C "$tmp" --strip-components=2 3x-ui-auto-main/assets/vh-dpid &&
         bash "$tmp/vh-dpid/build.sh" "$tmp/vh-dpid.bin"
@@ -102,6 +102,7 @@ cmd_install() (
     tmp=$(mktemp -d) || return 1
     trap 'rm -rf -- "$tmp"' EXIT
     exec 8>/run/3x-ui-torrent.lock && flock -w 600 8 || return 1
+    exec 9>&1
     if ! build_dpi "$tmp" 2>&1 | tee -a "$LOG"; then
         echo "Не удалось собрать детектор. Журнал $LOG" >&2
         return 1
