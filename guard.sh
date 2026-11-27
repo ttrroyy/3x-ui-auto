@@ -258,7 +258,7 @@ install_self() {
 cmd_install() {
     local counts
     msg_inf "Устанавливаю зависимости защиты..."
-    if ! { apt-get update -q && apt-get install -y -q ca-certificates curl nftables python3 util-linux; } >>"$LOG" 2>&1; then
+    if ! { apt-get update -q && apt-get -o DPkg::Lock::Timeout=300 install -y -q ca-certificates curl nftables python3 util-linux; } >>"$LOG" 2>&1; then
         msg_err "Не удалось установить зависимости. Журнал: $LOG"; return 1
     fi
     if legacy_guard; then

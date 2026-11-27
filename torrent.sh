@@ -94,7 +94,7 @@ cmd_install() (
     set -o pipefail
     local tmp attempt
     echo "Устанавливаю зависимости детектора BitTorrent. Журнал $LOG"
-    if ! { apt-get update -q && apt-get install -y -q --no-install-recommends ca-certificates curl nftables util-linux \
+    if ! { apt-get update -q && apt-get -o DPkg::Lock::Timeout=300 install -y -q --no-install-recommends ca-certificates curl nftables util-linux \
         build-essential autoconf automake libtool pkg-config libmnl-dev libpcap-dev; } 2>&1 | tee -a "$LOG"; then
         echo "Не удалось установить зависимости. Журнал $LOG" >&2
         return 1

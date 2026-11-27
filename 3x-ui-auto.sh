@@ -528,7 +528,7 @@ restore_preinstall_state() {
         if ! grep -Fxq "$package" "$dir/packages" &&
            dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -qx 'install ok installed'; then
             msg_inf "  Удаляю пакет: ${package}"
-            apt-get -y purge "$package" >/dev/null 2>&1 || msg_err "Не удалось удалить пакет ${package}; проверьте его вручную."
+            apt-get -o DPkg::Lock::Timeout=300 -y purge "$package" >/dev/null 2>&1 || msg_err "Не удалось удалить пакет ${package}; проверьте его вручную."
         fi
     done
 }
@@ -620,7 +620,7 @@ def write(path, text):
 
 def install(root):
     if root == Path('/') and not shutil.which('logrotate'):
-        command('apt-get', 'install', '-y', '--no-install-recommends', 'logrotate')
+        command('apt-get', '-o', 'DPkg::Lock::Timeout=300', 'install', '-y', '--no-install-recommends', 'logrotate')
     state = root / 'var/lib/3x-ui-auto/install/log-policy-baseline'
     marker = state / 'state.json'
     if not marker.is_file():
@@ -733,14 +733,14 @@ PY_XA_LOG_POLICY
 install_packages() {
     local nginx_repair=0
     apt-get -y update || return 1
-    apt-get -y install curl wget jq bash sudo openssl nginx-full certbot python3-certbot-nginx sqlite3 nftables fail2ban \
+    apt-get -o DPkg::Lock::Timeout=300 -y install curl wget jq bash sudo openssl nginx-full certbot python3-certbot-nginx sqlite3 nftables fail2ban \
         python3 python3-systemd cron iproute2 logrotate tar ca-certificates psmisc || return 1
     # A previous interrupted install can leave nginx installed without its config.
     [[ -f /etc/nginx/nginx.conf ]] || nginx_repair=1
     [[ -d /etc/nginx/sites-available && -d /etc/nginx/sites-enabled ]] || nginx_repair=1
     if [[ "$nginx_repair" == 1 ]]; then
         msg_inf "Repairing nginx package/configuration from a partial previous install..."
-        apt-get -y install --reinstall -o Dpkg::Options::=--force-confmiss nginx-common nginx-full || return 1
+        apt-get -o DPkg::Lock::Timeout=300 -y install --reinstall -o Dpkg::Options::=--force-confmiss nginx-common nginx-full || return 1
     fi
     install -d -m 0755 /etc/nginx /etc/nginx/sites-available /etc/nginx/sites-enabled \
         /etc/nginx/stream-enabled /etc/nginx/snippets
@@ -1837,7 +1837,7 @@ install_adguard() {
     [[ -f "$AGH_YAML" ]] && agh_web_port=$(grep -oP '^\s*address:\s*127\.0\.0\.1:\K\d+' "$AGH_YAML" | head -1 || true)
     [[ -n "$agh_web_port" ]] || agh_web_port=$(make_port)
     agh_dns_port=$(make_port)
-    apt-get install -y -q curl tar ca-certificates apache2-utils >/dev/null || return 1
+    apt-get -o DPkg::Lock::Timeout=300 install -y -q curl tar ca-certificates apache2-utils >/dev/null || return 1
     case "$(uname -m)" in x86_64) agh_arch="amd64";; aarch64) agh_arch="arm64";; armv7l) agh_arch="armv7";; *) msg_err "Unsupported architecture"; return 1;; esac
     if [[ ! -x "${AGH_DIR}/AdGuardHome" ]]; then
         mkdir -p /opt

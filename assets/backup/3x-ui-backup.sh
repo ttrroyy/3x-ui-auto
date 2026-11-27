@@ -162,7 +162,7 @@ cmd_restore() {
     local backup_file="${1:-}" unpacked_bytes unpacked_kb have_kb staging path src cert_path module legacy=0
     [[ -n "$backup_file" ]] || die "Usage: $0 restore <backup.tar.gz>"
     [[ -f "$backup_file" ]] || die "File not found: ${backup_file}"
-    command -v python3 >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -q python3; }
+    command -v python3 >/dev/null 2>&1 || { apt-get update -qq && apt-get -o DPkg::Lock::Timeout=300 install -y -q python3; }
     unpacked_bytes=$(verify_backup_archive "$backup_file") || die "Backup archive rejected"
 
     unpacked_kb=$(( (unpacked_bytes + 1023) / 1024 ))
@@ -182,7 +182,7 @@ cmd_restore() {
     blue "==> Installing packages..."
     apt-get update -qq
     # shellcheck disable=SC2086
-    apt-get install -y $PACKAGES
+    apt-get -o DPkg::Lock::Timeout=300 install -y $PACKAGES
     if [[ -f "$staging/ufw-state" ]]; then
         legacy=1
         curl -fsSL --proto '=https' --proto-redir '=https' "$REPO_RAW/assets/firewall.sh" -o "$staging/firewall.sh"
